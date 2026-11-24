@@ -143,6 +143,113 @@ Then, it runs NS-3 simulation script `./scratch/network-load-balance.cc`.
 Lastly, it runs FCT analyzer `./fctAnalysis.py` and switch resource analyzer `./queueAnalysis.py`. 
 
 
+##### Ring all-reduce
+
+Run the opt-in example from the ns-3 directory:
+
+```sh
+mkdir -p mix/output/ring
+./waf --run 'scratch/network-load-balance config/ring_all_reduce.txt' \
+  > mix/output/ring/collective.log
+```
+
+With `RING_ALL_REDUCE 1`, each `RING_JOB` line lists four host IDs in clockwise
+rank order followed by the number of iterations. For example, add these lines
+to the example config to run two jobs sharing the same hosts:
+
+```text
+RING_JOB 0 16 32 48 3
+RING_JOB 0 16 32 48 2
+```
+
+Jobs start together at `FLOWGEN_START_TIME`. Each job starts its next iteration
+after its own 24 transfers complete. Jobs share the configured chunk size and
+the four processing delays, which are indexed by rank within each job. With no
+`RING_JOB` entries, the example runs one iteration on hosts 0, 16, 32, and 48.
+`RING_TRANSFER` and `RING_COMPLETE` report zero-based job and iteration IDs.
+Set `FLOWGEN_STOP_TIME` far enough ahead for all jobs to finish.
+
+Analyze the simulator log with the scenario used for the run:
+
+```sh
+python3 analysis/analyze_ring.py mix/output/ring/collective.log \
+  --config config/ring_all_reduce.txt
+```
+
+The report includes collective and job completion times, rank start skew, and
+adjacent-step overlap. Overlap counts time when each step has at least one
+transfer in flight. Without the scenario, the script reports each job's
+observed iteration span because the intended iteration count is unknown.
+
+###### Report workloads
+
+The seven scenarios in `config/ring_report/` use
+`leaf_spine_128_100G_OS2`, 64 KiB chunks, ten iterations per ring, and seed 1.
+All jobs start at 2 s. Each ring uses four distinct hosts, and jobs within a
+scenario use disjoint hosts.
+
+| Workload | Rings | Active hosts | Leaves used |
+| --- | ---: | ---: | ---: |
+| `single_ring` | 1 | 4 | 4 |
+| `two_shared_leaves` | 2 | 8 | 4 |
+| `two_separate_leaves` | 2 | 8 | 8 |
+| `quarter_occupancy` | 8 | 32 | 8 |
+| `half_occupancy` | 16 | 64 | 8 |
+| `full_occupancy` | 32 | 128 | 8 |
+| `injected_rank_skew` | 1 | 4 | 4 |
+
+Only `injected_rank_skew` adds a rank delay, with 20 µs on zero-based rank 1.
+
+From the ns-3 directory, after configuring Waf as above, run one workload with
+ECMP/FECMP + DCQCN, the default (`LB_MODE 0`, `CC_MODE 1`).
+
+```sh
+python3 analysis/run_ring_suite.py single_ring
+```
+
+Run all seven workloads with each routing mode. ConWeave uses `LB_MODE 9`
+with the same host placements and DCQCN settings.
+
+```sh
+python3 analysis/run_ring_suite.py all
+python3 analysis/run_ring_suite.py all --routing conweave
+```
+
+Each run creates `mix/output/ring_report/<workload>/<routing>/` before launch
+and saves the effective `scenario.txt`, simulator stdout and stderr in
+`collective.log`, and the analyzer's report in `analysis.txt`. With Matplotlib
+installed in the runner's Python environment, it also writes PDF figures
+alongside those files.
+
+- `collective_completion.pdf` shows completion time by iteration, with the mean
+  and range across jobs.
+- `fct_slowdown.pdf` shows the transfer slowdown CDF for the fixed-size chunks.
+- `uplink_imbalance.pdf` shows the uplink imbalance CDF across active ToR
+  sampling intervals.
+- `voq_occupancy.pdf` shows the per-ToR virtual output queue occupancy CDF for
+  ConWeave runs.
+
+A repeat run of the same workload and routing mode overwrites these files.
+The runner exits with an error for simulator failures, missing collective
+completions, or plot generation failures. Regenerate the reports and figures
+from the saved scenarios and logs without rerunning the simulator.
+
+```sh
+python3 analysis/run_ring_suite.py all --analyze-only
+python3 analysis/run_ring_suite.py all --routing conweave --analyze-only
+```
+
+To analyze one log directly, run the analyzer with its saved scenario.
+
+```sh
+output=mix/output/ring_report/single_ring/ecmp
+python3 analysis/analyze_ring.py "$output/collective.log" --config "$output/scenario.txt"
+```
+
+Add `--built` to launch an existing build from `build/scratch/` directly.
+Add `--output-dir /tmp/ns3-ring-report` to choose a writable results root, and
+use the same option when reanalyzing those results.
+
 ##### Plot
 You can easily plot the results using the following command:
 ```shell

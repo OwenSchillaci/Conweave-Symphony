@@ -29,7 +29,9 @@
 
 #include <fstream>
 #include <iostream>
+#include <set>
 #include <unordered_map>
+#include <vector>
 
 #include "ns3/applications-module.h"
 #include "ns3/broadcom-node.h"
@@ -191,6 +193,152 @@ struct FlowInput {
 };
 FlowInput flow_input = {0};  // global variable
 uint32_t flow_num;
+
+constexpr uint32_t ringRanks = 4;
+constexpr uint32_t ringPhaseSteps = ringRanks - 1;
+constexpr uint32_t ringSteps = 2 * ringPhaseSteps;
+constexpr uint32_t ringTransfers = ringRanks * ringSteps;
+struct RingJob {
+    uint32_t hosts[ringRanks] = {0, 16, 32, 48};
+    uint32_t iterations = 1;
+    uint32_t iteration = 0;
+    uint32_t collectiveId = 0;
+    uint32_t nextStep[ringRanks] = {};
+    bool ready[ringRanks][ringSteps] = {};
+    uint32_t completed = 0;
+    Time start;
+};
+
+bool ringAllReduce = false;
+uint32_t ringChunkBytes = 65536;
+int64_t ringDelayNs[ringRanks] = {};
+std::vector<RingJob> ringJobs;
+std::unordered_map<uint32_t, uint32_t> ringActiveCollectives;  // collective ID -> job ID
+uint32_t ringNextCollectiveId = 0;
+uint32_t ringFinishedJobs = 0;
+uint64_t ringExpectedTransfers = 0;
+uint64_t ringCompletedTransfers = 0;
+
+void RingStepReady(uint32_t jobId, uint32_t rank, uint32_t step) {
+    auto &job = ringJobs[jobId];
+    job.ready[rank][step] = true;
+    uint32_t src = job.hosts[rank];
+    uint32_t dst = job.hosts[(rank + 1) % ringRanks];
+    Ptr<Node> srcNode = n.Get(src);
+    Ptr<Node> dstNode = n.Get(dst);
+    auto driver = srcNode->GetObject<RdmaDriver>();
+    auto &next = job.nextStep[rank];
+
+    // A ready chunk may overtake another chunk. Issue sends in local step order.
+    while (next < ringSteps && job.ready[rank][next]) {
+        int32_t flowId = job.collectiveId * ringTransfers + rank * ringSteps + next++;
+        driver->AddQueuePair(
+            ringChunkBytes, 3, serverAddress[src], serverAddress[dst], portNumber[src]++,
+            dportNumber[dst]++, has_win ? (global_t == 1 ? maxBdp : pairBdp[srcNode][dstNode]) : 0,
+            global_t == 1 ? maxRtt : pairRtt[srcNode][dstNode], flowId);
+    }
+}
+
+void StartRingIteration(uint32_t jobId) {
+    auto &job = ringJobs[jobId];
+    job.start = Simulator::Now();
+    job.completed = 0;
+    job.collectiveId = ringNextCollectiveId++;
+    ringActiveCollectives.emplace(job.collectiveId, jobId);
+    for (uint32_t rank = 0; rank < ringRanks; ++rank) {
+        job.nextStep[rank] = 0;
+        for (auto &ready : job.ready[rank]) {
+            ready = false;
+        }
+        RingStepReady(jobId, rank, 0);
+    }
+}
+
+void CompleteRingTransfer(Ptr<RdmaQueuePair> q) {
+    uint32_t collectiveId = q->m_flow_id / ringTransfers;
+    uint32_t jobId = ringActiveCollectives.at(collectiveId);
+    auto &job = ringJobs[jobId];
+    uint32_t rank = (q->m_flow_id % ringTransfers) / ringSteps;
+    uint32_t transferStep = q->m_flow_id % ringSteps;
+    bool allGather = transferStep >= ringPhaseSteps;
+    uint32_t step = transferStep % ringPhaseSteps;
+    uint32_t chunk = (rank + ringRanks - step + (allGather ? 1 : 0)) % ringRanks;
+    uint32_t dstRank = (rank + 1) % ringRanks;
+    Time now = Simulator::Now();
+    std::cout << "RING_TRANSFER job=" << jobId << " iteration=" << job.iteration
+              << " flow_id=" << q->m_flow_id << " rank=" << rank
+              << " phase=" << (allGather ? "all-gather" : "reduce-scatter") << " step=" << step
+              << " chunk=" << chunk << " src=" << job.hosts[rank] << " dst=" << job.hosts[dstRank]
+              << " sport=" << q->sport << " dport=" << q->dport << " bytes=" << q->m_size
+              << " start_ns=" << q->startTime.GetNanoSeconds()
+              << " completion_ns=" << now.GetNanoSeconds() << '\n';
+
+    // This ACK proves delivery. Enqueue the dependent send after QP cleanup,
+    // even when this rank's processing delay is zero.
+    if (transferStep + 1 < ringSteps) {
+        Simulator::Schedule(NanoSeconds(ringDelayNs[dstRank]), &RingStepReady, jobId, dstRank,
+                            transferStep + 1);
+    }
+    ++ringCompletedTransfers;
+    if (++job.completed == ringTransfers) {
+        ringActiveCollectives.erase(collectiveId);
+        std::cout << "RING_COMPLETE job=" << jobId << " iteration=" << job.iteration
+                  << " transfers=" << job.completed << " start_ns=" << job.start.GetNanoSeconds()
+                  << " completion_ns=" << now.GetNanoSeconds()
+                  << " duration_ns=" << (now - job.start).GetNanoSeconds() << '\n';
+        if (++job.iteration < job.iterations) {
+            Simulator::ScheduleNow(&StartRingIteration, jobId);
+        } else if (++ringFinishedJobs == ringJobs.size()) {
+            Simulator::Stop();
+        }
+    }
+}
+
+bool ScheduleRingJobs() {
+    if (flowgen_start_time < 0 || flowgen_stop_time <= flowgen_start_time ||
+        l2_ack_interval == 0) {
+        std::cerr << "Ring requires a valid flow generation time window and nonzero L2_ACK_INTERVAL\n";
+        return false;
+    }
+    if (ringJobs.empty()) {
+        ringJobs.emplace_back();
+    }
+
+    std::vector<uint64_t> transfersPerHost(n.GetN());
+    for (const auto &job : ringJobs) {
+        std::set<uint32_t> distinctHosts(job.hosts, job.hosts + ringRanks);
+        if (distinctHosts.size() != ringRanks) {
+            std::cerr << "Each RING_JOB requires four distinct hosts\n";
+            return false;
+        }
+        for (uint32_t rank = 0; rank < ringRanks; ++rank) {
+            uint32_t src = job.hosts[rank];
+            uint32_t dst = job.hosts[(rank + 1) % ringRanks];
+            if (src >= n.GetN() || dst >= n.GetN() || n.Get(src)->GetNodeType() != 0 ||
+                n.Get(dst)->GetNodeType() != 0 || pairBw[n.Get(src)][n.Get(dst)] == 0) {
+                std::cerr << "Ring requires connected end hosts. Invalid edge "
+                          << src << " -> " << dst << '\n';
+                return false;
+            }
+            transfersPerHost[src] += uint64_t(job.iterations) * ringSteps;
+            // A ring host sends and receives the same number of transfers.
+            if (transfersPerHost[src] > UINT16_MAX + 1u - portNumber[src] ||
+                transfersPerHost[src] > UINT16_MAX + 1u - dportNumber[src]) {
+                std::cerr << "Ring jobs would reuse RDMA ports on host " << src << '\n';
+                return false;
+            }
+        }
+        ringExpectedTransfers += uint64_t(job.iterations) * ringTransfers;
+        if (ringExpectedTransfers > uint64_t(INT32_MAX) + 1) {
+            std::cerr << "Ring jobs exceed the RDMA flow ID range\n";
+            return false;
+        }
+    }
+    for (uint32_t jobId = 0; jobId < ringJobs.size(); ++jobId) {
+        Simulator::Schedule(Seconds(flowgen_start_time), &StartRingIteration, jobId);
+    }
+    return true;
+}
 
 /**
  * Read flow input from file "flowf"
@@ -493,6 +641,9 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
                   (Simulator::Now() - q->startTime).GetTimeStep(), standalone_fct));
     Settings::cnt_finished_flows++;
     fflush(fout);
+    if (ringAllReduce) {
+        CompleteRingTransfer(q);
+    }
 }
 
 /**
@@ -894,6 +1045,43 @@ int main(int argc, char *argv[]) {
                 conf >> v;
                 flow_file = v;
                 std::cerr << "FLOW_FILE\t\t\t" << flow_file << "\n";
+            } else if (key == "RING_ALL_REDUCE") {
+                if (!(conf >> ringAllReduce)) {
+                    std::cerr << "RING_ALL_REDUCE requires 0 or 1\n";
+                    return 1;
+                }
+            } else if (key == "RING_CHUNK_BYTES") {
+                int64_t bytes;
+                if (!(conf >> bytes) || bytes <= 0 || bytes > UINT32_MAX) {
+                    std::cerr << "RING_CHUNK_BYTES requires a positive 32-bit byte count\n";
+                    return 1;
+                }
+                ringChunkBytes = bytes;
+            } else if (key == "RING_PROCESSING_DELAY_NS") {
+                for (auto &delay : ringDelayNs) {
+                    if (!(conf >> delay) || delay < 0) {
+                        std::cerr << "RING_PROCESSING_DELAY_NS requires four nonnegative delays\n";
+                        return 1;
+                    }
+                }
+            } else if (key == "RING_JOB") {
+                RingJob job;
+                int64_t hosts[ringRanks];
+                int64_t iterations;
+                if (!(conf >> hosts[0] >> hosts[1] >> hosts[2] >> hosts[3] >> iterations) ||
+                    iterations <= 0 || iterations > UINT32_MAX) {
+                    std::cerr << "RING_JOB requires four host IDs and a positive iteration count\n";
+                    return 1;
+                }
+                for (uint32_t rank = 0; rank < ringRanks; ++rank) {
+                    if (hosts[rank] < 0 || hosts[rank] > UINT32_MAX) {
+                        std::cerr << "RING_JOB host IDs must be nonnegative 32-bit integers\n";
+                        return 1;
+                    }
+                    job.hosts[rank] = hosts[rank];
+                }
+                job.iterations = iterations;
+                ringJobs.push_back(job);
             } else if (key.compare("FLOWGEN_START_TIME") == 0) {
                 double v;
                 conf >> v;
@@ -1140,10 +1328,12 @@ int main(int argc, char *argv[]) {
      * @brief open topology config, input-flows config.
      */
     topof.open(topology_file.c_str());
-    flowf.open(flow_file.c_str());
     uint32_t node_num, switch_num, link_num;
     topof >> node_num >> switch_num >> link_num;
-    flowf >> flow_num;
+    if (!ringAllReduce) {
+        flowf.open(flow_file.c_str());
+        flowf >> flow_num;
+    }
 
     /*-------Parameter of Settings-------*/
     Settings::node_num = node_num;
@@ -1730,7 +1920,11 @@ int main(int argc, char *argv[]) {
 
     flow_input.idx = 0;
     port_per_host = new uint16_t[node_num - switch_num];
-    if (flow_num > 0) {
+    if (ringAllReduce) {
+        if (!ScheduleRingJobs()) {
+            return 1;
+        }
+    } else if (flow_num > 0) {
         // generate flows
         ReadFlowInput();
         Simulator::Schedule(Seconds(0), &ScheduleFlowInputs, flow_input_stream);
@@ -1787,9 +1981,13 @@ int main(int argc, char *argv[]) {
     std::cout << "Running Simulation.\n";
     fflush(stdout);
     NS_LOG_INFO("Run Simulation.");
-    Simulator::Schedule(Seconds(flowgen_start_time),
-                        &stop_simulation_middle);  // check every 100us
-    Simulator::Stop(Seconds(flowgen_stop_time + 10.0));
+    if (ringAllReduce) {
+        Simulator::Stop(Seconds(flowgen_stop_time));
+    } else {
+        Simulator::Schedule(Seconds(flowgen_start_time),
+                            &stop_simulation_middle);  // check every 100us
+        Simulator::Stop(Seconds(flowgen_stop_time + 10.0));
+    }
     Simulator::Run();
 
     /*-----------------------------------------------------------------------------*/
@@ -1800,4 +1998,9 @@ int main(int argc, char *argv[]) {
     NS_LOG_INFO("Done.");
     endt = clock();
     std::cerr << (double)(endt - begint) / CLOCKS_PER_SEC << "\n";
+    if (ringAllReduce && ringFinishedJobs != ringJobs.size()) {
+        std::cerr << "Ring timed out after " << ringCompletedTransfers << '/' << ringExpectedTransfers
+                  << " transfers and " << ringFinishedJobs << '/' << ringJobs.size() << " jobs\n";
+        return 1;
+    }
 }
