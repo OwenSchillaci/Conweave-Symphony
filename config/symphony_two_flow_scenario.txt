@@ -1,0 +1,33 @@
+TOPOLOGY_FILE config/symphony_two_flow_topology.txt
+SYMPHONY_TWO_FLOW 1
+FLOWGEN_START_TIME 0.01
+FLOWGEN_STOP_TIME 0.11
+
+LB_MODE 0
+CC_MODE 1
+SYMPHONY_MODE 0
+SYMPHONY_ADAPTIVE_ALPHA 0
+SYMPHONY_GAIN 0.01
+RANDOM_SEED 1
+ENABLE_PFC 1
+ENABLE_QCN 1
+USE_DYNAMIC_PFC_THRESHOLD 1
+BUFFER_SIZE 9
+PACKET_PAYLOAD_SIZE 1000
+L2_ACK_INTERVAL 1
+L2_CHUNK_SIZE 4000
+RATE_AI 40Mb/s
+RATE_HAI 100Mb/s
+EWMA_GAIN 0.00390625
+KMAX_MAP 1 10000000000 100
+KMIN_MAP 1 10000000000 50
+PMAX_MAP 1 10000000000 0.20
+
+FLOW_INPUT_FILE mix/output/symphony_two_flow/flow.txt
+FCT_OUTPUT_FILE mix/output/symphony_two_flow/fct.txt
+CNP_OUTPUT_FILE mix/output/symphony_two_flow/cnp.txt
+PFC_OUTPUT_FILE mix/output/symphony_two_flow/pfc.txt
+VOQ_MON_FILE mix/output/symphony_two_flow/voq.txt
+VOQ_MON_DETAIL_FILE mix/output/symphony_two_flow/voq_detail.txt
+UPLINK_MON_FILE mix/output/symphony_two_flow/uplink.txt
+CONN_MON_FILE mix/output/symphony_two_flow/conn.txt

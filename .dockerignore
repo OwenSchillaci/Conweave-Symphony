@@ -1,0 +1,12 @@
+.git
+build
+.waf*
+.lock-waf*
+**/__pycache__
+**/*.pyc
+analysis/figures
+mix/.history
+mix/output
+mix/*_flow.txt
+config/*_flow.txt
+*.tr

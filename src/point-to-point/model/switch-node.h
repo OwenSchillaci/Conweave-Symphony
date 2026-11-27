@@ -29,6 +29,33 @@ class SwitchNode : public Node {
     uint32_t m_ackHighPrio;  // set high priority for ACK/NACK
 
    private:
+    friend class SymphonyAlphaTest;
+
+    struct SymphonyProgress {
+        uint32_t stepMin = 0;
+        uint32_t psnRec = 0;
+        int64_t window = -1;
+        uint64_t alpha = 1;
+        uint64_t total = 0;
+        uint64_t outpacing = 0;
+        bool activated = false;
+    };
+    uint32_t m_symphonyMode = 0;
+    uint32_t m_symphonyPayload = 0;
+    uint32_t m_symphonyWarmup = 0;
+    double m_symphonyGain = 0;
+    bool m_symphonyAdaptiveAlpha = true;
+    uint32_t m_symphonyMinSamples = 32;
+    Ptr<UniformRandomVariable> m_symphonyRandom;
+    std::unordered_map<uint32_t, SymphonyProgress> m_symphonyProgress;
+
+    uint32_t m_figure4Trace = 0;
+    int64_t m_figure4ActivationNs = 0;
+    uint32_t m_figure4DequeueRecords = 0;
+    uint64_t m_figure4Marks = 0;
+
+    bool SymphonyMark(Ptr<Packet> p, bool queueMark);
+
     int GetOutDev(Ptr<Packet>, CustomHeader &ch);
     void SendToDev(Ptr<Packet> p, CustomHeader &ch);
     void SendToDevContinue(Ptr<Packet> p, CustomHeader &ch);
@@ -70,6 +97,12 @@ class SwitchNode : public Node {
     void ClearTable();
     bool SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> packet, CustomHeader &ch);
     void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
+    void ConfigureSymphony(uint32_t mode, uint32_t payload, uint32_t warmup, double gain,
+                           bool adaptiveAlpha = true, uint32_t minSamples = 32);
+    void ConfigureFigure4(uint32_t trace, int64_t activationNs);
+    uint64_t GetFigure4Marks() const { return m_figure4Marks; }
+    void StartSymphonyCollective(uint32_t collective);
+    void FinishSymphonyCollective(uint32_t collective);
     uint64_t GetTxBytesOutDev(uint32_t outdev);
 };
 

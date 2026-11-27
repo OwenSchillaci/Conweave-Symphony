@@ -6,14 +6,10 @@ from collections import defaultdict
 from pathlib import Path
 
 
-PHASES = {"reduce-scatter": 0, "all-gather": 3}
-STEP_NAMES = ("RS0", "RS1", "RS2", "AG0", "AG1", "AG2")
-OPERATIONS = {(step, rank) for step in range(6) for rank in range(4)}
-
-
 def read_log(path):
     transfers = defaultdict(dict)
     completions = {}
+    rank_counts = {}
     with path.open() as log:
         for line_number, line in enumerate(log, 1):
             fields = line.split()
@@ -22,32 +18,36 @@ def read_log(path):
             try:
                 data = dict(field.split("=", 1) for field in fields[1:])
                 key = int(data["job"]), int(data["iteration"])
+                ranks = int(data.get("ranks", 4))
+                if ranks < 2 or ranks != rank_counts.setdefault(key[0], ranks):
+                    raise ValueError("invalid or inconsistent rank count")
+                phase_steps = ranks - 1
                 start, end = int(data["start_ns"]), int(data["completion_ns"])
                 if min(key) < 0 or start < 0 or end < start:
                     raise ValueError("invalid job, iteration, or timestamps")
                 if fields[0] == "RING_TRANSFER":
                     step, rank = int(data["step"]), int(data["rank"])
-                    if not (0 <= step < 3 and 0 <= rank < 4):
+                    if not (0 <= step < phase_steps and 0 <= rank < ranks):
                         raise ValueError("step or rank out of range")
-                    operation = PHASES[data["phase"]] + step, rank
+                    operation = {"reduce-scatter": 0, "all-gather": phase_steps}[data["phase"]] + step, rank
                     if operation in transfers[key]:
                         raise ValueError("duplicate operation")
                     transfers[key][operation] = (start, end)
                 else:
                     if key in completions:
                         raise ValueError("duplicate collective completion")
-                    if int(data["transfers"]) != len(OPERATIONS):
+                    if int(data["transfers"]) != 2 * ranks * phase_steps:
                         raise ValueError("unexpected transfer count in collective completion")
                     if int(data["duration_ns"]) != end - start:
                         raise ValueError("collective duration disagrees with timestamps")
                     completions[key] = (start, end)
             except (KeyError, ValueError) as exc:
                 raise ValueError(f"{path}:{line_number}: {exc}") from exc
-    return transfers, completions
+    return transfers, completions, rank_counts
 
 
 def expected_jobs(path):
-    """Read the iteration counts from the simulator scenario, including its default."""
+    """Read the rank and iteration counts from the simulator scenario, including its default."""
     enabled = False
     jobs = []
     with path.open() as config:
@@ -60,12 +60,12 @@ def expected_jobs(path):
                     raise ValueError(f"{path}:{line_number}: expected RING_ALL_REDUCE 0 or 1")
                 enabled = fields[1] == "1"
             elif fields[0] == "RING_JOB":
-                if len(fields) != 6 or not fields[5].isdigit() or int(fields[5]) < 1:
+                if len(fields) < 4 or not fields[-1].isdigit() or int(fields[-1]) < 1:
                     raise ValueError(f"{path}:{line_number}: invalid RING_JOB iteration count")
-                jobs.append(int(fields[5]))
+                jobs.append((len(fields) - 2, int(fields[-1])))
     if not enabled:
         raise ValueError(f"{path}: ring workload is disabled")
-    return jobs or [1]
+    return jobs or [(4, 1)]
 
 
 def active_intervals(intervals):
@@ -79,14 +79,15 @@ def active_intervals(intervals):
     return merged
 
 
-def analyze(transfers, completions, expected):
+def analyze(transfers, completions, rank_counts, expected):
     keys = transfers.keys() | completions.keys()
     if not keys and expected is None:
         raise ValueError("no ring records found")
     if expected is not None and any(
-        job >= len(expected) or iteration >= expected[job] for job, iteration in keys
+        job >= len(expected) or iteration >= expected[job][1] or
+        rank_counts[job] != expected[job][0] for job, iteration in keys
     ):
-        raise ValueError("log contains a job or iteration outside the supplied scenario")
+        raise ValueError("log contains a job, iteration, or rank count inconsistent with the supplied scenario")
 
     job_iterations = defaultdict(dict)
     for job, iteration in sorted(keys):
@@ -94,10 +95,15 @@ def analyze(transfers, completions, expected):
         operations = transfers.get(key, {})
         summary = completions.get(key)
         label = f"Job {job}, iteration {iteration}"
-        if operations.keys() != OPERATIONS:
+        ranks = rank_counts[job]
+        phase_steps = ranks - 1
+        step_count = 2 * phase_steps
+        operation_count = step_count * ranks
+        # The log parser bounds and deduplicates each operation.
+        if len(operations) != operation_count:
             if summary is not None:
                 raise ValueError(f"{label}: completion record has missing transfer records")
-            print(f"{label}  incomplete log ({len(operations)}/{len(OPERATIONS)} transfers)")
+            print(f"{label}  incomplete log ({len(operations)}/{operation_count} transfers)")
             continue
 
         start = min(s for s, _ in operations.values())
@@ -108,9 +114,10 @@ def analyze(transfers, completions, expected):
         print(f"{label}  collective completion time {end - start} ns{evidence}")
         job_iterations[job][iteration] = (start, end)
 
-        steps = [[operations[step, rank] for rank in range(4)] for step in range(6)]
+        step_names = [f"{phase}{step}" for phase in ("RS", "AG") for step in range(phase_steps)]
+        steps = [[operations[step, rank] for rank in range(ranks)] for step in range(step_count)]
         print("  Step  First start (ns)   Last ACK (ns)  Start skew (ns)")
-        for name, intervals in zip(STEP_NAMES, steps):
+        for name, intervals in zip(step_names, steps):
             first = min(s for s, _ in intervals)
             last = max(e for _, e in intervals)
             skew = max(s for s, _ in intervals) - first
@@ -126,7 +133,7 @@ def analyze(transfers, completions, expected):
                 for s1, e1 in following_active
             )
             lead = max(0, max(e for _, e in previous) - min(s for s, _ in following))
-            pair = f"{STEP_NAMES[index]} -> {STEP_NAMES[index + 1]}"
+            pair = f"{step_names[index]} -> {step_names[index + 1]}"
             print(f"  {pair:14}  {overlap:21}  {lead:20}")
         print()
 
@@ -137,7 +144,7 @@ def analyze(transfers, completions, expected):
     jobs = range(len(expected)) if expected is not None else sorted(observed)
     for job in jobs:
         finished = job_iterations[job]
-        count = expected[job] if expected is not None else max(observed[job]) + 1
+        count = expected[job][1] if expected is not None else max(observed[job]) + 1
         if len(finished) != count:
             scope = "configured" if expected is not None else "through last observed iteration"
             print(f"  Job {job}  incomplete ({len(finished)}/{count} iterations {scope})")
@@ -156,8 +163,8 @@ def main():
     parser.add_argument("--config", type=Path, help="scenario used to generate the log")
     args = parser.parse_args()
     try:
-        transfers, completions = read_log(args.log)
-        analyze(transfers, completions, expected_jobs(args.config) if args.config else None)
+        transfers, completions, rank_counts = read_log(args.log)
+        analyze(transfers, completions, rank_counts, expected_jobs(args.config) if args.config else None)
     except (OSError, ValueError) as exc:
         parser.exit(1, f"{parser.prog}: {exc}\n")
 

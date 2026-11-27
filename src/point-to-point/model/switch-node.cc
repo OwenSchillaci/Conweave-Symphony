@@ -5,6 +5,8 @@
 #include "ns3/conweave-routing.h"
 #include "ns3/double.h"
 #include "ns3/flow-id-tag.h"
+#include "ns3/flow-id-num-tag.h"
+#include "flow-stat-tag.h"
 #include "ns3/int-header.h"
 #include "ns3/ipv4-header.h"
 #include "ns3/ipv4.h"
@@ -15,6 +17,7 @@
 #include "ns3/uinteger.h"
 #include "ppp-header.h"
 #include "qbb-net-device.h"
+#include "ring-progress-tag.h"
 
 namespace ns3 {
 
@@ -62,8 +65,8 @@ uint32_t SwitchNode::DoLbFlowECMP(Ptr<const Packet> p, const CustomHeader &ch,
                                   const std::vector<int> &nexthops) {
     // pick one next hop based on hash
     union {
-        uint8_t u8[4 + 4 + 2 + 2];
-        uint32_t u32[3];
+        uint8_t u8[16];
+        uint32_t u32[4];
     } buf;
     buf.u32[0] = ch.sip;
     buf.u32[1] = ch.dip;
@@ -80,8 +83,16 @@ uint32_t SwitchNode::DoLbFlowECMP(Ptr<const Packet> p, const CustomHeader &ch,
         assert(false && "Cannot support other protoocls than TCP/UDP");
     }
 
-    uint32_t hashVal = EcmpHash(buf.u8, 12, m_ecmpSeed);
+    buf.u8[12] = ch.l3Prot;
+    uint32_t hashVal = EcmpHash(buf.u8, m_figure4Trace ? 13 : 12, m_ecmpSeed);
     uint32_t idx = hashVal % nexthops.size();
+    if (m_figure4Trace == 2 && ch.l3Prot == 17 && ch.udp.seq == 0) {
+        FlowIDNUMTag flow;
+        if (p->PeekPacketTag(flow)) {
+            std::cout << "FIGURE4_ROUTE switch=" << GetId() << " flow_id=" << flow.GetId()
+                      << " port=" << nexthops[idx] << '\n';
+        }
+    }
     return nexthops[idx];
 }
 
@@ -330,6 +341,143 @@ void SwitchNode::DoSwitchSend(Ptr<Packet> p, CustomHeader &ch, uint32_t outDev, 
     m_devices[outDev]->SwitchSend(qIndex, p, ch);
 }
 
+void SwitchNode::ConfigureSymphony(uint32_t mode, uint32_t payload, uint32_t warmup,
+                                   double gain, bool adaptiveAlpha, uint32_t minSamples) {
+    m_symphonyMode = mode;
+    m_symphonyPayload = payload;
+    m_symphonyWarmup = warmup;
+    m_symphonyGain = gain;
+    m_symphonyAdaptiveAlpha = adaptiveAlpha;
+    m_symphonyMinSamples = minSamples;
+    m_symphonyRandom = CreateObject<UniformRandomVariable>();
+    m_symphonyRandom->SetStream(100000 + GetId());
+}
+
+void SwitchNode::ConfigureFigure4(uint32_t trace, int64_t activationNs) {
+    m_figure4Trace = trace;
+    m_figure4ActivationNs = activationNs;
+}
+
+void SwitchNode::StartSymphonyCollective(uint32_t collective) {
+    m_symphonyProgress.emplace(collective, SymphonyProgress{});
+}
+
+void SwitchNode::FinishSymphonyCollective(uint32_t collective) {
+    m_symphonyProgress.erase(collective);
+}
+
+bool SwitchNode::SymphonyMark(Ptr<Packet> p, bool queueMark) {
+    RingProgressTag ring;
+    if (!p->PeekPacketTag(ring)) {
+        return false;
+    }
+    CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header | CustomHeader::L4_Header);
+    p->PeekHeader(ch);
+    if (ch.l3Prot != 0x11) {
+        return false;
+    }
+    FlowIDNUMTag flow;
+    FlowStatTag stat;
+    if (!p->PeekPacketTag(stat)) {
+        return false;
+    }
+
+    const RingProgress metadata = ring.GetProgress();
+    const uint32_t collective = metadata.collectiveId;
+    const uint32_t step = metadata.step;
+    auto entry = m_symphonyProgress.find(collective);
+    if (entry == m_symphonyProgress.end()) {
+        return false;
+    }
+
+    // The NIC emits offsets in payload bytes, including on the short final packet.
+    const uint32_t psn = ch.udp.seq / m_symphonyPayload;
+    const bool last = stat.GetType() == FlowStatTag::FLOW_END ||
+                      stat.GetType() == FlowStatTag::FLOW_START_AND_END;
+    const int64_t now = Simulator::Now().GetNanoSeconds();
+    const int64_t window = now / 100000;  // Lazy reset at 100 us window boundaries.
+    auto &progress = entry->second;
+    const bool live = !m_figure4Trace || now >= m_figure4ActivationNs;
+    if (live && !progress.activated) {
+        progress.activated = true;
+        progress.total = 0;
+        progress.outpacing = 0;
+    }
+    const bool adapt = live && m_symphonyAdaptiveAlpha;
+    if (progress.window != window) {
+        if (adapt && progress.window >= 0) {
+            const uint64_t alphaBefore = progress.alpha;
+            if (progress.total > m_symphonyMinSamples) {
+                // Compare with 25% using ceiling division without multiplying counters.
+                const uint64_t threshold = progress.total / 4 + (progress.total % 4 != 0);
+                if (progress.outpacing >= threshold) {
+                    ++progress.alpha;
+                } else if (progress.alpha > 1) {
+                    --progress.alpha;
+                }
+            }
+            if (!m_figure4Trace) {
+                std::cout << "SYMPHONY_WINDOW time_ns=" << now << " switch=" << GetId()
+                      << " collective_id=" << collective << " window=" << progress.window
+                      << " total=" << progress.total << " outpacing=" << progress.outpacing
+                      << " alpha_before=" << alphaBefore << " alpha_after=" << progress.alpha
+                      << '\n';
+            }
+            progress.total = 0;
+            progress.outpacing = 0;
+        }
+        progress.window = window;
+        progress.psnRec = 0;
+    }
+
+    const uint32_t previousStep = progress.stepMin;
+    if (adapt) {
+        ++progress.total;
+        progress.outpacing += step > previousStep;
+    }
+    if (last) {
+        progress.stepMin = step + 1;
+        progress.psnRec = 0;
+    } else if (step < progress.stepMin) {
+        progress.stepMin = step;
+        progress.psnRec = psn;
+    } else if (step == progress.stepMin) {
+        progress.psnRec = std::max(progress.psnRec, psn);
+    }
+
+    const bool outpacing = step > progress.stepMin;
+    const bool eligible = live && outpacing && progress.psnRec > m_symphonyWarmup;
+    // Log mode draws from the same isolated RNG as active mode.
+    const double probability = eligible
+        ? std::min(1.0, m_symphonyGain * progress.alpha * psn / progress.psnRec) : 0.0;
+    const double draw = eligible ? m_symphonyRandom->GetValue() : 1.0;
+    const bool selected = eligible && draw < probability;
+    const bool symphonyMark = m_symphonyMode == 2 && selected;
+    if (m_figure4Trace && symphonyMark) {
+        if (++m_figure4Marks == 1) {
+            std::cout << "FIGURE4_FIRST_MARK switch=" << GetId() << " time_ns=" << now
+                      << " packet_uid=" << p->GetUid() << '\n';
+        }
+    }
+    const bool detailed = m_figure4Trace == 2 && m_figure4DequeueRecords < 10000 &&
+                          (symphonyMark || last || step < previousStep);
+    if (detailed || (!m_figure4Trace && (outpacing || last || step < previousStep || queueMark))) {
+        ++m_figure4DequeueRecords;
+        const int32_t flowId = p->PeekPacketTag(flow) ? flow.GetId() : -1;
+        const char *cause = symphonyMark ? (queueMark ? "both" : "symphony")
+                                        : (queueMark ? "queue" : "none");
+        std::cout << "SYMPHONY_DEQUEUE time_ns=" << now << " switch=" << GetId()
+                  << " packet_uid=" << p->GetUid() << " flow_id=" << flowId
+                  << " collective_id=" << collective << " step=" << step
+                  << " seq_bytes=" << ch.udp.seq << " psn=" << psn << " last=" << last
+                  << " previous_step_min=" << previousStep << " step_min=" << progress.stepMin
+                  << " psn_rec=" << progress.psnRec << " outpacing=" << outpacing
+                  << " alpha=" << progress.alpha << " eligible=" << eligible << " probability=" << probability
+                  << " draw=" << draw << " selected=" << selected << " mark=" << cause << '\n';
+    }
+    return symphonyMark;
+}
+
 void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
     FlowIdTag t;
     p->PeekPacketTag(t);
@@ -341,17 +489,16 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
             m_mmu->RemoveFromIngressAdmission(inDev, qIndex, p->GetSize());
         }
         m_mmu->RemoveFromEgressAdmission(ifIndex, qIndex, p->GetSize());
-        if (m_ecnEnabled) {
-            bool egressCongested = m_mmu->ShouldSendCN(ifIndex, qIndex);
-            if (egressCongested) {
-                PppHeader ppp;
-                Ipv4Header h;
-                p->RemoveHeader(ppp);
-                p->RemoveHeader(h);
-                h.SetEcn((Ipv4Header::EcnType)0x03);
-                p->AddHeader(h);
-                p->AddHeader(ppp);
-            }
+        const bool queueMark = m_ecnEnabled && m_mmu->ShouldSendCN(ifIndex, qIndex);
+        const bool symphonyMark = m_symphonyMode != 0 && SymphonyMark(p, queueMark);
+        if (queueMark || symphonyMark) {
+            PppHeader ppp;
+            Ipv4Header h;
+            p->RemoveHeader(ppp);
+            p->RemoveHeader(h);
+            h.SetEcn((Ipv4Header::EcnType)0x03);
+            p->AddHeader(h);
+            p->AddHeader(ppp);
         }
         // NOTE: ConWeave's probe/reply does not need to pass inDev interface
         if (inDev != Settings::CONWEAVE_CTRL_DUMMY_INDEV) {

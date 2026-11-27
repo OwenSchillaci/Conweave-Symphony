@@ -183,6 +183,12 @@ Ptr<RdmaQueuePair> RdmaHw::GetQp(uint64_t key) {
 void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip,
                           uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt,
                           int32_t flow_id) {
+    AddQueuePair(size, pg, sip, dip, sport, dport, win, baseRtt, flow_id, RingProgress());
+}
+
+void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Address dip,
+                          uint16_t sport, uint16_t dport, uint32_t win, uint64_t baseRtt,
+                          int32_t flow_id, RingProgress ringProgress) {
     // create qp
     Ptr<RdmaQueuePair> qp = CreateObject<RdmaQueuePair>(pg, sip, dip, sport, dport);
     qp->SetSize(size);
@@ -190,6 +196,7 @@ void RdmaHw::AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address sip, Ipv4Addre
     qp->SetBaseRtt(baseRtt);
     qp->SetVarWin(m_var_win);
     qp->SetFlowId(flow_id);
+    qp->m_ringProgress = ringProgress;
     qp->SetTimeout(m_waitAckTimeout);
 
     if (m_irn) {
@@ -289,6 +296,13 @@ void RdmaHw::DeleteRxQp(uint32_t dip, uint16_t dport, uint16_t sport, uint16_t p
     m_rxQpMap.erase(key);
 }
 
+static uint32_t g_symphonyTraceLimit = 0;
+static uint32_t g_symphonyFeedback = 0;
+static uint32_t g_symphonyCnp = 0;
+static uint32_t g_symphonyRate = 0;
+
+void RdmaHw::EnableSymphonyTrace(uint32_t limit) { g_symphonyTraceLimit = limit; }
+
 int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
     uint8_t ecnbits = ch.GetIpv4EcnBits();
 
@@ -374,6 +388,15 @@ int RdmaHw::ReceiveUdp(Ptr<Packet> p, CustomHeader &ch) {
 
         newp->AddHeader(head);
         AddHeader(newp, 0x800);  // Attach PPP header
+
+        if (ecnbits && g_symphonyFeedback < g_symphonyTraceLimit) {
+            ++g_symphonyFeedback;
+            std::cout << "SYMPHONY_FEEDBACK time_ns=" << Simulator::Now().GetNanoSeconds()
+                      << " receiver=" << m_node->GetId() << " packet_uid=" << p->GetUid()
+                      << " ack_uid=" << newp->GetUid() << " flow_id=" << rxQp->m_flow_id
+                      << " seq_bytes=" << ch.udp.seq << " ack_seq_bytes=" << seqh.GetSeq()
+                      << " cnp=1" << '\n';
+        }
 
         // send
         uint32_t nic_idx = GetNicIdxOfRxQp(rxQp);
@@ -546,6 +569,13 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
     // handle cnp
     if (cnp) {
         if (m_cc_mode == 1) {  // mlx version
+            if (g_symphonyCnp < g_symphonyTraceLimit) {
+                ++g_symphonyCnp;
+                std::cout << "SYMPHONY_CNP time_ns=" << Simulator::Now().GetNanoSeconds()
+                          << " sender=" << m_node->GetId() << " ack_uid=" << p->GetUid()
+                          << " flow_id=" << qp->m_flow_id << " finished=" << qp->IsFinished()
+                          << '\n';
+            }
             cnp_received_mlx(qp);
         }
     }
@@ -788,6 +818,10 @@ Ptr<Packet> RdmaHw::GetNxtPacket(Ptr<RdmaQueuePair> qp) {
     ppp.SetProtocol(0x0021);  // EtherToPpp(0x800), see point-to-point-net-device.cc
     p->AddHeader(ppp);
 
+    if (qp->m_ringProgress.IsPresent()) {
+        p->AddPacketTag(RingProgressTag(qp->m_ringProgress));
+    }
+
     // attach Stat Tag
     uint8_t packet_pos = UINT8_MAX;
     {
@@ -957,7 +991,15 @@ void RdmaHw::CheckRateDecreaseMlx(Ptr<RdmaQueuePair> q) {
         if (clamp) {
             q->mlx.m_targetRate = q->m_rate;
         }
+        const uint64_t previousRate = q->m_rate.GetBitRate();
         q->m_rate = std::max(m_minRate, q->m_rate * (1 - q->mlx.m_alpha / 2));
+        if (g_symphonyRate < g_symphonyTraceLimit && previousRate != q->m_rate.GetBitRate()) {
+            ++g_symphonyRate;
+            std::cout << "SYMPHONY_RATE time_ns=" << Simulator::Now().GetNanoSeconds()
+                      << " sender=" << m_node->GetId() << " flow_id=" << q->m_flow_id
+                      << " before_bps=" << previousRate << " after_bps=" << q->m_rate.GetBitRate()
+                      << " finished=" << q->IsFinished() << '\n';
+        }
         // reset rate increase related things
         q->mlx.m_rpTimeStage = 0;
         q->mlx.m_decrease_cnp_arrived = false;

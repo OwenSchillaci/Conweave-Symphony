@@ -1,6 +1,7 @@
 #ifndef RDMA_QUEUE_PAIR_H
 #define RDMA_QUEUE_PAIR_H
 
+#include "ring-progress-tag.h"
 #include <ns3/custom-header.h>
 #include <ns3/data-rate.h>
 #include <ns3/event-id.h>
@@ -68,6 +69,7 @@ class RdmaQueuePair : public Object {
     uint32_t wp;          // current window of packets
     uint32_t lastPktSize;
     int32_t m_flow_id;
+    RingProgress m_ringProgress;
     Time m_timeout;
 
     /******************************

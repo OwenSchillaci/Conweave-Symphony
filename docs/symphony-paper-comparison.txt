@@ -1,0 +1,57 @@
+SYMPHONY EMPIRICAL FIGURES — LOCAL NS-3 COMPARISON
+
+Paper: https://arxiv.org/html/2604.16880v1
+PDF: https://arxiv.org/pdf/2604.16880
+
+Summary
+The clearest mechanism-level agreement was Fig. 9: marking the leading flow helped the lagging flow, by 27.4% at k=0.01 locally versus about 12% in the cited hardware case. The clearest ring-level agreement was Fig. 8(a): median normalized JCT improved in the measured three-job hotspot. The largest disagreement was Fig. 8(c): at 8 MiB, local Symphony took 7.71× the matched baseline, while the paper reports up to about 20% improvement for larger chunks. Every plot is a local comparison. Paper values below are published summaries, separate from ns-3 observations. No curves were digitized.
+
+Common setup
+Paper software: Astra-Sim collectives over ns-3 packet transport, 10 Gb/s leaf–spine, ECMP with DCQCN and RED (50/100/0.2), default k=0.01, tau=0.25 and 100 us controller windows. Table 1 specifies 32 nodes by default, 4 ToRs and 4 spines, 2/4 cores, and 8 MB default chunks. Paper §4.1 says aggregate software JCT and CCT use at least 20 seeded runs. Panel counts below are specific where given.
+Local software: native ACK-driven one-dimensional rings, 100 Gb/s ECMP leaf–spine topology from config/ring_eight_rank.txt, DCQCN/QCN/PFC and RED (100/400/0.2). Unless noted, the main ring uses hosts 0,16,32,48,64,80,96,112 with two iterations. Baselines retain DCQCN and disable Symphony. Adaptive tests use 100 us windows, tau=0.25, a 32-packet sample guard, and per-collective state. Fixed tests use alpha=1. Seeds are paired by scenario and iterations retain seed, job, and iteration IDs.
+
+Fig. 9 — local comparison, hardware response reproduced qualitatively
+Paper §4.7 and Fig. 9: two equal flows (about 1 GB each) on one shared 10 Gb/s Tofino2 port with ConnectX-6 DCQCN, several start offsets, and k=0.01. Repetition count is unstated. For the reported 500 ms delay case the lagging/leading hardware FCTs were 1382/1399 ms with DCQCN and 1210/1433 ms with Symphony. Hardware overlap fell from 882 to 710 ms.
+Local: same shared-egress layout and link rate, three simulated 10 Gb/s ports, 16 MiB per flow, 6.7 ms start offset, fixed alpha, seed 1 and one flow pair per setting. Plot measures RDMA payload bytes dequeued each 100 us; completions are sender ACK times. The paper figure shows transmission lifetimes rather than sampled rates. The three repeated baseline throughput CSVs matched exactly.
+
+Mode                Lagging ms  Leading ms  Overlap ms  Both finished ms  Symphony-only marks traced to CNP
+DCQCN                  21.424      21.424      14.724           28.124       0
+Fixed k=0.001          21.424      24.863      18.163           28.124      26
+Fixed k=0.003          17.168      33.075      17.168           33.075      35
+Fixed k=0.01           15.555      38.436      15.555           38.436      47
+
+Unlike the paper's cited hardware case, local overlap increased and the leader's FCT penalty at k=0.01 was 79.4%. The lagging-flow benefit did not repay the cost for the pair. The hardware values are also saved in figure9_paper_reference.csv.
+
+Fig. 8(c) — chunk size, local comparison
+Paper §4.6: 2D Ring AllReduce on its 10 Gb/s simulation fabric, chunk labels 128 kB, 512 kB, 2 MB, 8 MB and 32 MB, normalized CCT, with larger-chunk improvements up to about 20%. The panel-specific run count is unstated beyond §4.1.
+Local: 64 KiB, 128 KiB, 512 KiB, 1 MiB, 2 MiB, 8 MiB and 32 MiB on the same eight ranks; all runs use the same 120 us host processing delay at rank 1, except the separate aligned 64 KiB control. Seeds 1–3, two collectives per seed per case. Each normalized point is the mean of matched Symphony/DCQCN CCT ratios at that size. The plotted points CSV contains absolute mean CCTs.
+64/128 KiB skewed and aligned 64 KiB were null. At 1 MiB, adaptive Symphony took 4.502 ms versus 1.631 ms; at 8 MiB it took 81.508 ms versus 10.572 ms, or 7.71×; at 32 MiB, 247.267 ms versus 41.224 ms, or 6.00×. The experiment holds network parameters fixed. The rank delay models host skew. These are binary units and the workload, rates, transport configuration, and topology differ from the paper.
+
+Fig. 8(b) — marking gain, local comparison
+Paper §4.6: normalized CCT for 2D rings with 32/128/256 MB workloads; k from 1e-5 to 1, favorable range 0.001–0.01. Panel-specific run count unstated beyond §4.1.
+Local: 1 MiB chunk per transfer, same eight-rank host-skew case, seeds 1–3 with two samples per seed. Fixed and adaptive curves separately sweep 1e-5, 1e-4, 0.001, 0.003, 0.01, 0.1, and 1. CCT is normalized to the matched 1 MiB baseline. Near-zero gains were close to baseline; no tested setting beat it on mean CCT. Fixed k=0.001/0.003/0.01 took 2.332/3.051/4.026 ms against 1.631 ms. Adaptive took 3.198/3.997/4.502 ms. At seed 1 these three fixed gains produced 116/272/512 Symphony marks; the corresponding adaptive runs produced 386/520/798 marks. The trace shows the feedback operated and CCT worsened. It does not establish that every rate change was caused by Symphony.
+
+Fig. 8(a) — network contention, local comparison
+Paper §4.6: multiple parallel 1D rings on 128 nodes, 10 Gb/s ECMP/DCQCN, CDF of normalized JCT for imbalance ratios 1.13/1.29/1.67. The paper reports a stronger effect at higher imbalance. Panel-specific run count unstated beyond §4.1.
+Local: two or three eight-rank jobs with zero injected host delay share receiver 0's egress. Other receivers differ by job. Each group uses seeds 1–3, two 1 MiB collectives per job and adaptive k=0.01. Per-job JCT is normalized to the same job and seed with Symphony off; the CDF has six and nine job samples respectively, clustered by seed. Contention is measured from payload dequeues on receiver 0 in 100 us bins in which two or more jobs appear. Relative to the seven other primary-job receiver egresses in the same bins, the DCQCN hotspot averaged 3.32–4.55× with two jobs and 3.80–5.14× with three. This measured service ratio differs from the paper's imposed traffic skew. The JCT ratio medians were 0.961 and 0.759. Some jobs slowed, and the measured ratio ranges overlap, so this establishes a benefit under those shared-link conditions without establishing a monotonic response to imbalance.
+
+Figs. 4(a), 4(b), 5 — overlap and CCT, local comparisons
+Paper §4.2: multiple 1D rings, ECMP; a representative timeline reaches about 30 active steps in baseline and at most five under Symphony. Fifty-run max-overlap ranges are 24–35 baseline and 3–6 Symphony. Fig. 5 uses 100 runs of the Table 1 Ring AllReduce workload and reports about 22% lower median CCT versus DCQCN and 19% versus priority queuing.
+Local: 1 MiB per transfer, 120 us host skew, adaptive k=0.01, seeds 1–20. Each CDF has 40 collectives per mode, two correlated iterations per seed. Timeline displays seed 1, iteration 0. A step is counted at time t if any of its rank transfers is in flight at t, from QP start through its final sender ACK, using half-open intervals. Count is collective-wide across all ranks and paths. This is a count of distinct logical steps, separate from the older adjacent-step overlap duration. The paper motivates overlap on a bottleneck but does not publish a precise timestamp/counting rule for these plots. Our eight-rank ring can have at most 14 logical steps. Median maximum overlap held at 3 while median CCT rose from 1.631 to 4.511 ms (~177%). Late-start and priority variants are omitted. The dedicated Figure 4 reconstruction separately covers late activation. A faithful step-aware strict-priority comparator remains unavailable.
+
+Fig. 2 — motivating example, local comparison
+Paper §2.2: multiple parallel 1D rings, theoretical lockstep, ECMP baseline, balanced routing with injected 1.13× load skew and transient background traffic, on the software fabric above. Reports up to ~30 overlapping steps, and 60% CCT inflation for the ECMP baseline relative to theoretical lockstep. Figure-specific run count unstated.
+Local: seed 1, iteration 0, 1 MiB chunks, DCQCN alone. The measured aligned run serves as a reference, with separate host-skew and measured shared-receiver cases. Each logical step finishes when its last rank transfer is ACKed. At a step's completion we plot the reciprocal of its inter-completion interval divided by the corresponding aligned rate. The first step has no previous interval and is omitted. This uses measured alignment and persistent co-location in place of a theoretical curve and transient background traffic. Peak local active steps rise from one under alignment to three with host skew. The minimum normalized inter-step rate is 0.453 with skew and 0.068 under co-location, consistent with the motivating step-rate drop.
+
+Fig. 6 — unsupported
+Paper §4.4: Astra-Sim original Transformer with hybrid data/model parallelism, normalized end-to-end JCT at computation reductions 1× through 64×, using the software fabric and congestion control above. Figure-specific run count unstated beyond §4.1. The paper reports nearly 30% JCT improvement at 64×. The checkout has no Transformer execution trace, compute/communication dependency graph, hybrid-parallel schedule, or calibrated compute-duration model. Native ring completion alone cannot supply this metric.
+
+Fig. 7(a–c) — multi-tenancy, local comparisons
+Paper §4.5: 128-node 10 Gb/s software fabric, two co-located jobs, each using 16 parallel rings, offset by 500 ms. It reports higher aggregate throughput and a shorter last-step tail with Symphony. The timeline run count is unstated; the tail CDF uses 50 runs. Fig. 7(c) uses 50 random-arrival runs with 16/32/64-node jobs, 4/16/32 MB workload sizes and 16–128 passes, with 3–4 jobs concurrent. The paper reports up to about 17% JCT improvement for 64 nodes.
+Local 7(a–b): two identical eight-rank jobs share all eight receiver links, 1 MiB chunks, 0.5 ms start offset, adaptive k=0.01. One seed is shown in 7(a), using actual payload dequeues summed across receiver egresses; this may include retransmissions. 7(b) has 12 collective final-step completion spans per mode, from 3 seeds × 2 jobs × 2 iterations. Throughput traces and last-step span distributions were identical between modes.
+Local 7(c): a 16-, 32-, and 64-rank ring share hosts and links concurrently. Start offsets are independently chosen from the first 100 us with seeds 1–3 and reused for each paired treatment. Each job has two passes with 64 KiB chunks; each CDF has three job samples per scale. Median normalized JCT was 0.865, 1.543 and 4.793 for 16, 32 and 64 ranks respectively. This local workload gives the opposite scale trend and does not reproduce the paper's workload-size or pass distribution.
+
+Reruns
+The README lists the stage and plotting commands. Each run produces its
+effective scenario, log, and processed metrics under the chosen output
+directory. These observations summarize the original local runs.

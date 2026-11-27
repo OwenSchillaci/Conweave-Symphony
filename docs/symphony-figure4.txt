@@ -1,0 +1,97 @@
+SYMPHONY FIGURE 4 RECONSTRUCTION
+
+Reference: https://arxiv.org/html/2604.16880v1#S4.SS2
+Published comparison values: across 50 runs, baseline maximum step overlap
+24–35 and Symphony maximum step overlap 3–6. These are reference values, not
+acceptance thresholds. Exact Figure 4 channel placement and propagation
+delay were not published in the paper.
+
+Assumptions and settings
+32 hosts, four ToRs and four spines in a single spine group; no core tier;
+three links per inter-ToR path; 10 Gb/s and 1 us per link. Four distinct
+32-rank channel orderings share the 32 physical NICs and one Symphony
+collective ID. Each of 7,936 channel transfers sends 8,000,000 payload bytes,
+for 63,488,000,000 bytes (about 63.5 GB) per full-size collective, before
+headers, ACKs or retransmissions. Channel count, shared NICs and per-transfer
+payload are reconstruction assumptions. No injected host delay or background
+traffic. RDMA uses the checkout's 1,000-byte packet payload, ACK interval 1,
+and existing DCQCN/PFC defaults. IRN is disabled. ECMP uses a seeded five-tuple
+hash and fixed flow tuples across treatments.
+
+RED unit check: SwitchMmu::ConfigEcn multiplies KMIN_MAP and KMAX_MAP by 1000.
+This setup uses 50,000 and 100,000 bytes of MMU shared egress-queue occupancy
+and Pmax=0.2. These match the paper's printed numeric settings. The paper's
+Figure 4 setup does not specify threshold units beyond those settings.
+The packet traces report the device egress queue's total queued bytes as a
+separate congestion observation. Symphony uses adaptive alpha, k=0.01,
+100 us windows, a 25% outpacing threshold, and the checkout's 32-packet
+sample guard. Late start tracks progress before activation and starts with
+alpha 1 and fresh counters at 500 ms.
+
+Measurement
+Collective-wide overlap counts a logical step once whenever any rank in
+any of its four channels has a transfer in flight, from QP start to final ACK.
+Same-egress overlap counts distinct logical steps observed departing the
+same port within a 100 us bin. It is a second metric with a different
+scope, and not the number of in-flight steps on that link. The analytical
+lockstep line ends at the 1.5872 s per-NIC payload serialization floor.
+The ECDF uses one sample per full-size completed collective and only
+includes seeds with both an off and an on result. The smoke run is excluded.
+
+64 KiB smoke, seed 1
+All 7,936 transfers completed per case, four distinct channel IDs and one
+collective ID (0). Every flow followed the same route in the matched runs.
+Switch 33 saw channel 1, flow 2232, send a LAST packet at 10,217,445 ns,
+advancing step_min from 0 to 1. At 10,217,476 ns, channel 3, flow 7502,
+sent a non-final step-0 packet. It restored step_min to 0 and psn_rec to
+55. Baseline peak overlap was 26 collective-wide and 25 on one egress.
+With Symphony, both peaks were 5. CCT was 49.190 ms off and 56.401 ms on.
+These are small-chunk validation results, separate from the full pilot.
+
+Regression: the existing single-ring scenario completed all ten collectives.
+Both point-to-point unit cases passed, including the adaptive-alpha test.
+
+Runtime and outputs
+Seed-1 full-size results are under bytes-8000000/seed-1. Each run records
+wall time, peak resident memory, raw and compressed log size, and its exact
+simulator command. Detailed decisions and RDMA feedback are capped at
+10,000 records per switch or feedback type; switch mark totals are complete.
+
+Seed 1 trace checks
+In the full-size baseline, switch 35 port 9 transmitted step-0 flow 4526
+(channel 2) at 38,600,199 ns and step-1 flow 6697 (channel 3) at
+38,607,976 ns. Both were in flight in the same 100 us bin, where the
+measured device egress backlog reached 74,408 bytes. Flow 4526 completed
+at 79,383,291 ns, and its same-channel dependent step-1 flow 4589 was
+released at exactly that timestamp. This shows shared egress use and a
+real ACK-gated dependency in the unmodified baseline scheduler.
+Late start: all four channels were active at simulation time 510,000,000 ns
+(500 ms after collective launch). The 834 transfer completions before
+activation matched the baseline. The earliest Symphony mark was at
+510,003,270 ns, 3.270 us after activation. There were no Symphony marks
+before activation.
+For those same flow IDs in the always-on run, flow 4526 completed and
+released flow 4589 at 74,195,366 ns, 5,187,925 ns earlier than baseline.
+The competing step-1 flow 6697 started at the same time in both runs
+and completed 42,674,665 ns later with Symphony. This trace demonstrates
+the dependency benefit and the bandwidth-shift cost for this specific
+pair; the aggregate CCT determines the net effect.
+
+Full-size pilot, seed 1
+Each run completed 7,936 transfers on identical paired paths.
+mode    CCT(s)    peak collective / egress   wall(min)   peak RSS(MiB)   raw/gzip log(MiB)    marks
+off     4.925610  17 / 16                      33.33         66.34         279.41 / 47.23       0
+on      5.639715   3 /  2                      38.38         70.79         168.99 / 27.15       1324366
+late    5.569582   8 /  7                      36.93         70.24         189.09 / 30.39       1358092
+Always-on changed CCT by +14.50%; late-start changed CCT by +13.07%.
+Baseline maximum overlap was below the published 24–35 range; the always-on
+maximum was within the published 3–6 range. Lower overlap accompanied longer
+CCT in this run, unlike the paper's reported roughly 30% CCT improvement.
+The full-size RDMA trace cap was consumed before the first Symphony marks,
+so it could not match them to sender CNPs. The short-chunk run had 6579 matches.
+The full-size switch mark totals and late-start first-mark checks are uncapped.
+Fifty full matched pairs project to approximately 59.4 simulator CPU hours
+from the measured pilot. Compact logs reduce storage and I/O but retain packet
+simulation. The sweep was limited to one full-size completed pair (seed 1).
+Figure 4(b) is a one-seed pilot ECDF. Use --seeds and --workers to extend it.
+Completed summaries are saved atomically and plots update as pairs finish.

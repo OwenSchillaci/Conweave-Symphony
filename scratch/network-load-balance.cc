@@ -27,9 +27,13 @@
 #include <ns3/switch-node.h>
 #include <time.h>
 
+#include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <map>
 #include <set>
+#include <tuple>
+#include <sstream>
 #include <unordered_map>
 #include <vector>
 
@@ -39,6 +43,7 @@
 #include "ns3/conweave-voq.h"
 #include "ns3/core-module.h"
 #include "ns3/error-model.h"
+#include "ns3/flow-id-num-tag.h"
 #include "ns3/global-route-manager.h"
 #include "ns3/internet-module.h"
 #include "ns3/ipv4-static-routing-helper.h"
@@ -194,48 +199,276 @@ struct FlowInput {
 FlowInput flow_input = {0};  // global variable
 uint32_t flow_num;
 
-constexpr uint32_t ringRanks = 4;
-constexpr uint32_t ringPhaseSteps = ringRanks - 1;
-constexpr uint32_t ringSteps = 2 * ringPhaseSteps;
-constexpr uint32_t ringTransfers = ringRanks * ringSteps;
 struct RingJob {
-    uint32_t hosts[ringRanks] = {0, 16, 32, 48};
+    std::vector<uint32_t> hosts = {0, 16, 32, 48};
+    std::vector<int64_t> delayNs;
     uint32_t iterations = 1;
     uint32_t iteration = 0;
     uint32_t collectiveId = 0;
-    uint32_t nextStep[ringRanks] = {};
-    bool ready[ringRanks][ringSteps] = {};
-    uint32_t completed = 0;
+    uint64_t flowIdBase = 0;
+    std::vector<std::pair<uint16_t, uint16_t>> figure4Ports;
+    std::vector<uint32_t> nextStep;
+    std::vector<std::vector<uint8_t>> ready;
+    uint64_t completed = 0;
     Time start;
+
+    uint32_t Ranks() const { return hosts.size(); }
+    uint32_t PhaseSteps() const { return Ranks() - 1; }
+    uint32_t Steps() const { return 2 * PhaseSteps(); }
+    uint64_t Transfers() const { return uint64_t(Ranks()) * Steps(); }
 };
 
+// Only the ring directives reserve the remainder of their line for arguments.
+bool ReadRingArguments(std::istream &config, std::vector<int64_t> &values) {
+    std::string line;
+    std::getline(config, line);
+    std::istringstream fields(line.substr(0, line.find('#')));
+    std::string token;
+    while (fields >> token) {
+        std::istringstream number(token);
+        int64_t value;
+        char trailing;
+        if (!(number >> value) || value < 0 || (number >> trailing)) {
+            return false;
+        }
+        values.push_back(value);
+    }
+    return true;
+}
+
+bool symphonyTwoFlow = false;
+constexpr uint32_t twoFlowBytes = 16 * 1024 * 1024;
+constexpr uint32_t twoFlowReceiver = 2;
+constexpr uint32_t twoFlowSwitch = 3;
+uint32_t twoFlowCompleted = 0;
+
 bool ringAllReduce = false;
+uint32_t symphonyMode = 0;
+uint32_t symphonyWarmup = 4;
+double symphonyGain = 0.01;
+bool symphonyAdaptiveAlpha = true;
+uint32_t symphonyMinSamples = 32;
+std::vector<Ptr<SwitchNode>> symphonySwitches;
 uint32_t ringChunkBytes = 65536;
-int64_t ringDelayNs[ringRanks] = {};
+std::vector<int64_t> ringDelayNs;
+std::unordered_map<uint32_t, std::vector<int64_t>> ringJobDelays;
 std::vector<RingJob> ringJobs;
 std::unordered_map<uint32_t, uint32_t> ringActiveCollectives;  // collective ID -> job ID
 uint32_t ringNextCollectiveId = 0;
+uint64_t ringNextFlowId = 0;
 uint32_t ringFinishedJobs = 0;
 uint64_t ringExpectedTransfers = 0;
 uint64_t ringCompletedTransfers = 0;
+
+uint32_t figure4Trace = 0;  // 1: summaries; 2: representative traces.
+bool figure4Late = false;
+std::vector<Ptr<SwitchNode>> figure4Switches;
+
+struct Figure4EgressBin {
+    int64_t bin = -1;
+    uint64_t steps = 0;
+    uint32_t queueMax = 0;
+    int32_t firstFlow = -1;
+    int32_t otherFlow = -1;
+    int64_t firstNs = 0;
+    int64_t otherNs = 0;
+};
+
+std::map<std::pair<uint32_t, uint32_t>, Figure4EgressBin> figure4Egress;
+
+void EmitFigure4Bin(uint32_t sw, uint32_t port, const Figure4EgressBin &value) {
+    if (value.otherFlow >= 0) {
+        std::cout << "FIGURE4_EGRESS switch=" << sw << " port=" << port
+                  << " bin=" << value.bin << " steps=" << value.steps
+                  << " queue_bytes=" << value.queueMax << " flow_a=" << value.firstFlow
+                  << " flow_b=" << value.otherFlow << " time_a_ns=" << value.firstNs
+                  << " time_b_ns=" << value.otherNs << '\n';
+    }
+}
+
+void TraceFigure4Egress(QbbNetDevice *dev, Figure4EgressBin *state,
+                        Ptr<const Packet> packet, uint32_t queue) {
+    RingProgressTag tag;
+    if (queue == 0 || !packet->PeekPacketTag(tag)) {
+        return;
+    }
+    const int64_t now = Simulator::Now().GetNanoSeconds();
+    const int64_t bin = now / 100000;
+    if (state->bin != bin) {
+        EmitFigure4Bin(dev->GetNode()->GetId(), dev->GetIfIndex(), *state);
+        *state = Figure4EgressBin{};
+        state->bin = bin;
+    }
+    const uint64_t bit = uint64_t(1) << tag.GetProgress().step;
+    state->queueMax = std::max(state->queueMax, dev->GetQueue()->GetNBytesTotal());
+    if (!(state->steps & bit) && state->otherFlow < 0) {
+        FlowIDNUMTag flow;
+        if (packet->PeekPacketTag(flow)) {
+            if (state->firstFlow < 0) {
+                state->firstFlow = flow.GetId();
+                state->firstNs = now;
+            } else {
+                state->otherFlow = flow.GetId();
+                state->otherNs = now;
+            }
+        }
+    }
+    state->steps |= bit;
+}
+
+bool ringEgressTrace = false;
+std::map<uint32_t, int64_t> ringJobStartOffsets;
+std::map<std::tuple<int64_t, uint32_t, uint32_t>, uint64_t> ringEgressBytes;
+
+void TraceRingEgress(uint32_t dst, Ptr<const Packet> packet, uint32_t queue) {
+    RingProgressTag tag;
+    if (queue == 0 || !packet->PeekPacketTag(tag)) {
+        return;
+    }
+    const auto job = ringActiveCollectives.find(tag.GetProgress().collectiveId);
+    if (job == ringActiveCollectives.end()) {
+        return;
+    }
+    CustomHeader header(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                        CustomHeader::L4_Header);
+    const uint32_t headerSize = packet->PeekHeader(header);
+    if (header.l3Prot == 17) {
+        const int64_t bin = Simulator::Now().GetNanoSeconds() / 100000;
+        ringEgressBytes[std::make_tuple(bin, job->second, dst)] += packet->GetSize() - headerSize;
+    }
+}
+
+bool ConnectRingEgressTraces() {
+    std::set<uint32_t> hosts;
+    for (const auto &job : ringJobs) {
+        hosts.insert(job.hosts.begin(), job.hosts.end());
+    }
+    for (uint32_t host : hosts) {
+        uint32_t connected = 0;
+        Ptr<Node> endpoint = n.Get(host);
+        for (uint32_t i = 0; i < endpoint->GetNDevices(); ++i) {
+            auto device = DynamicCast<QbbNetDevice>(endpoint->GetDevice(i));
+            if (!device || !device->GetChannel()) {
+                continue;
+            }
+            auto channel = device->GetChannel();
+            for (uint32_t j = 0; j < channel->GetNDevices(); ++j) {
+                auto peer = DynamicCast<QbbNetDevice>(channel->GetDevice(j));
+                if (peer && peer->GetNode()->GetNodeType() == 1 &&
+                    peer->TraceConnectWithoutContext("QbbDequeue",
+                        MakeBoundCallback(&TraceRingEgress, host))) {
+                    ++connected;
+                }
+            }
+        }
+        if (connected != 1) {
+            std::cerr << "Ring egress telemetry requires one traced link per receiver\n";
+            return false;
+        }
+    }
+    return true;
+}
+
+void TraceTwoFlowEgress(Ptr<const Packet> packet, uint32_t queue) {
+    if (queue == 0) {
+        return;
+    }
+    RingProgressTag tag;
+    if (!packet->PeekPacketTag(tag)) {
+        return;
+    }
+    CustomHeader header(CustomHeader::L2_Header | CustomHeader::L3_Header |
+                        CustomHeader::L4_Header);
+    const uint32_t headerSize = packet->PeekHeader(header);
+    if (header.l3Prot == 17) {
+        std::cout << "TWO_FLOW_EGRESS step=" << tag.GetProgress().step
+                  << " time_ns=" << Simulator::Now().GetNanoSeconds()
+                  << " bytes=" << packet->GetSize() - headerSize << '\n';
+    }
+}
+
+void StartTwoFlowTransfer(uint32_t step) {
+    Ptr<Node> src = n.Get(step);
+    Ptr<Node> dst = n.Get(twoFlowReceiver);
+    RingProgress progress;
+    progress.step = step;
+    std::cout << "TWO_FLOW_START step=" << step
+              << " time_ns=" << Simulator::Now().GetNanoSeconds() << '\n';
+    src->GetObject<RdmaDriver>()->AddQueuePair(
+        twoFlowBytes, 3, serverAddress[step], serverAddress[twoFlowReceiver],
+        portNumber[step]++, dportNumber[twoFlowReceiver]++,
+        has_win ? (global_t == 1 ? maxBdp : pairBdp[src][dst]) : 0,
+        global_t == 1 ? maxRtt : pairRtt[src][dst], step, progress);
+}
+
+bool ScheduleTwoFlow() {
+    if (n.GetN() != 4 || n.Get(twoFlowSwitch)->GetNodeType() != 1 ||
+        flowgen_start_time < 0 || flowgen_stop_time <= flowgen_start_time + 0.0067) {
+        std::cerr << "Invalid topology or time window for the two-flow experiment\n";
+        return false;
+    }
+
+    Ptr<Node> sw = n.Get(twoFlowSwitch);
+    Ptr<QbbNetDevice> egress;
+    for (uint32_t host = 0; host <= twoFlowReceiver; ++host) {
+        Ptr<Node> endpoint = n.Get(host);
+        Ptr<QbbNetDevice> link;
+        for (uint32_t i = 0; i < sw->GetNDevices(); ++i) {
+            Ptr<QbbNetDevice> dev = DynamicCast<QbbNetDevice>(sw->GetDevice(i));
+            if (!dev || !dev->GetChannel()) {
+                continue;
+            }
+            Ptr<Channel> channel = dev->GetChannel();
+            for (uint32_t j = 0; j < channel->GetNDevices(); ++j) {
+                if (channel->GetDevice(j)->GetNode() == endpoint) {
+                    link = dev;
+                }
+            }
+        }
+        if (endpoint->GetNodeType() != 0 || !link ||
+            link->GetDataRate().GetBitRate() != 10000000000ull) {
+            std::cerr << "Two-flow topology requires three hosts directly linked to switch 3 at 10 Gb/s\n";
+            return false;
+        }
+        if (host == twoFlowReceiver) {
+            egress = link;
+        }
+    }
+    if (!egress || !egress->TraceConnectWithoutContext("QbbDequeue", MakeCallback(&TraceTwoFlowEgress))) {
+        std::cerr << "Could not trace the shared receiver-facing egress\n";
+        return false;
+    }
+    for (const auto &sw : symphonySwitches) {
+        sw->StartSymphonyCollective(0);
+    }
+    const Time start = Seconds(flowgen_start_time);
+    Simulator::Schedule(start, &StartTwoFlowTransfer, 1u);
+    Simulator::Schedule(start + MicroSeconds(6700), &StartTwoFlowTransfer, 0u);
+    return true;
+}
 
 void RingStepReady(uint32_t jobId, uint32_t rank, uint32_t step) {
     auto &job = ringJobs[jobId];
     job.ready[rank][step] = true;
     uint32_t src = job.hosts[rank];
-    uint32_t dst = job.hosts[(rank + 1) % ringRanks];
+    uint32_t dst = job.hosts[(rank + 1) % job.Ranks()];
     Ptr<Node> srcNode = n.Get(src);
     Ptr<Node> dstNode = n.Get(dst);
     auto driver = srcNode->GetObject<RdmaDriver>();
     auto &next = job.nextStep[rank];
 
     // A ready chunk may overtake another chunk. Issue sends in local step order.
-    while (next < ringSteps && job.ready[rank][next]) {
-        int32_t flowId = job.collectiveId * ringTransfers + rank * ringSteps + next++;
+    while (next < job.Steps() && job.ready[rank][next]) {
+        int32_t flowId = job.flowIdBase + uint64_t(rank) * job.Steps() + next;
+        RingProgress progress;
+        progress.collectiveId = figure4Trace ? 0 : job.collectiveId;
+        const auto ports = figure4Trace ? job.figure4Ports[rank * job.Steps() + next]
+                                        : std::make_pair(portNumber[src]++, dportNumber[dst]++);
+        progress.step = next++;
         driver->AddQueuePair(
-            ringChunkBytes, 3, serverAddress[src], serverAddress[dst], portNumber[src]++,
-            dportNumber[dst]++, has_win ? (global_t == 1 ? maxBdp : pairBdp[srcNode][dstNode]) : 0,
-            global_t == 1 ? maxRtt : pairRtt[srcNode][dstNode], flowId);
+            ringChunkBytes, 3, serverAddress[src], serverAddress[dst], ports.first,
+            ports.second, has_win ? (global_t == 1 ? maxBdp : pairBdp[srcNode][dstNode]) : 0,
+            global_t == 1 ? maxRtt : pairRtt[srcNode][dstNode], flowId, progress);
     }
 }
 
@@ -244,8 +477,15 @@ void StartRingIteration(uint32_t jobId) {
     job.start = Simulator::Now();
     job.completed = 0;
     job.collectiveId = ringNextCollectiveId++;
+    job.flowIdBase = ringNextFlowId;
+    ringNextFlowId += job.Transfers();
     ringActiveCollectives.emplace(job.collectiveId, jobId);
-    for (uint32_t rank = 0; rank < ringRanks; ++rank) {
+    for (const auto &sw : symphonySwitches) {
+        if (!figure4Trace || jobId == 0) {
+            sw->StartSymphonyCollective(job.collectiveId);
+        }
+    }
+    for (uint32_t rank = 0; rank < job.Ranks(); ++rank) {
         job.nextStep[rank] = 0;
         for (auto &ready : job.ready[rank]) {
             ready = false;
@@ -255,35 +495,47 @@ void StartRingIteration(uint32_t jobId) {
 }
 
 void CompleteRingTransfer(Ptr<RdmaQueuePair> q) {
-    uint32_t collectiveId = q->m_flow_id / ringTransfers;
+    // Figure 4 reserves equal, contiguous flow-ID blocks for its four channels.
+    const uint32_t collectiveId = figure4Trace
+        ? q->m_flow_id / ringJobs.front().Transfers() : q->m_ringProgress.collectiveId;
     uint32_t jobId = ringActiveCollectives.at(collectiveId);
     auto &job = ringJobs[jobId];
-    uint32_t rank = (q->m_flow_id % ringTransfers) / ringSteps;
-    uint32_t transferStep = q->m_flow_id % ringSteps;
-    bool allGather = transferStep >= ringPhaseSteps;
-    uint32_t step = transferStep % ringPhaseSteps;
-    uint32_t chunk = (rank + ringRanks - step + (allGather ? 1 : 0)) % ringRanks;
-    uint32_t dstRank = (rank + 1) % ringRanks;
+    uint32_t rank = (q->m_flow_id - job.flowIdBase) / job.Steps();
+    uint32_t transferStep = q->m_ringProgress.step;
+    bool allGather = transferStep >= job.PhaseSteps();
+    uint32_t step = transferStep % job.PhaseSteps();
+    uint32_t chunk = (rank + job.Ranks() - step + (allGather ? 1 : 0)) % job.Ranks();
+    uint32_t dstRank = (rank + 1) % job.Ranks();
     Time now = Simulator::Now();
     std::cout << "RING_TRANSFER job=" << jobId << " iteration=" << job.iteration
+              << " ranks=" << job.Ranks()
               << " flow_id=" << q->m_flow_id << " rank=" << rank
               << " phase=" << (allGather ? "all-gather" : "reduce-scatter") << " step=" << step
               << " chunk=" << chunk << " src=" << job.hosts[rank] << " dst=" << job.hosts[dstRank]
               << " sport=" << q->sport << " dport=" << q->dport << " bytes=" << q->m_size
               << " start_ns=" << q->startTime.GetNanoSeconds()
-              << " completion_ns=" << now.GetNanoSeconds() << '\n';
+              << " completion_ns=" << now.GetNanoSeconds();
+    if (figure4Trace) {
+        std::cout << " collective_id=" << q->m_ringProgress.collectiveId;
+    }
+    std::cout << '\n';
 
     // This ACK proves delivery. Enqueue the dependent send after QP cleanup,
     // even when this rank's processing delay is zero.
-    if (transferStep + 1 < ringSteps) {
-        Simulator::Schedule(NanoSeconds(ringDelayNs[dstRank]), &RingStepReady, jobId, dstRank,
+    if (transferStep + 1 < job.Steps()) {
+        Simulator::Schedule(NanoSeconds(job.delayNs[dstRank]), &RingStepReady, jobId, dstRank,
                             transferStep + 1);
     }
     ++ringCompletedTransfers;
-    if (++job.completed == ringTransfers) {
+    if (++job.completed == job.Transfers()) {
         ringActiveCollectives.erase(collectiveId);
+        for (const auto &sw : symphonySwitches) {
+            if (!figure4Trace || ringFinishedJobs + 1 == ringJobs.size()) {
+                sw->FinishSymphonyCollective(figure4Trace ? 0 : collectiveId);
+            }
+        }
         std::cout << "RING_COMPLETE job=" << jobId << " iteration=" << job.iteration
-                  << " transfers=" << job.completed << " start_ns=" << job.start.GetNanoSeconds()
+                  << " ranks=" << job.Ranks() << " transfers=" << job.completed << " start_ns=" << job.start.GetNanoSeconds()
                   << " completion_ns=" << now.GetNanoSeconds()
                   << " duration_ns=" << (now - job.start).GetNanoSeconds() << '\n';
         if (++job.iteration < job.iterations) {
@@ -300,27 +552,57 @@ bool ScheduleRingJobs() {
         std::cerr << "Ring requires a valid flow generation time window and nonzero L2_ACK_INTERVAL\n";
         return false;
     }
+    if (figure4Trace && (ringJobs.size() != 4 || !ringJobStartOffsets.empty() ||
+                        ringEgressTrace ||
+                        std::any_of(ringJobs.begin(), ringJobs.end(), [](const RingJob &job) {
+                            return job.Ranks() != 32 || job.iterations != 1;
+                        }))) {
+        std::cerr << "Figure 4 requires four simultaneous single-iteration 32-rank channels\n";
+        return false;
+    }
     if (ringJobs.empty()) {
         ringJobs.emplace_back();
     }
 
-    std::vector<uint64_t> transfersPerHost(n.GetN());
-    for (const auto &job : ringJobs) {
-        std::set<uint32_t> distinctHosts(job.hosts, job.hosts + ringRanks);
-        if (distinctHosts.size() != ringRanks) {
-            std::cerr << "Each RING_JOB requires four distinct hosts\n";
+    for (const auto &entry : ringJobDelays) {
+        if (entry.first >= ringJobs.size()) {
+            std::cerr << "RING_JOB_DELAY_NS refers to unknown job " << entry.first << '\n';
             return false;
         }
-        for (uint32_t rank = 0; rank < ringRanks; ++rank) {
+    }
+    std::vector<uint64_t> transfersPerHost(n.GetN());
+    for (uint32_t jobId = 0; jobId < ringJobs.size(); ++jobId) {
+        auto &job = ringJobs[jobId];
+        std::set<uint32_t> distinctHosts(job.hosts.begin(), job.hosts.end());
+        if (job.hosts.size() < 2 || job.hosts.size() > n.GetN() ||
+            distinctHosts.size() != job.hosts.size()) {
+            std::cerr << "Each RING_JOB requires at least two distinct hosts in the topology\n";
+            return false;
+        }
+        auto delay = ringJobDelays.find(jobId);
+        job.delayNs = delay == ringJobDelays.end() ? ringDelayNs : delay->second;
+        if (job.delayNs.empty()) {
+            job.delayNs.resize(job.Ranks());
+        } else if (job.delayNs.size() != job.Ranks()) {
+            std::cerr << "Processing delay count must match rank count for job " << jobId << '\n';
+            return false;
+        }
+        const uint64_t availableFlowIds = uint64_t(INT32_MAX) + 1 - ringExpectedTransfers;
+        if (2ull * job.PhaseSteps() > availableFlowIds / job.iterations / job.Ranks()) {
+            std::cerr << "Ring jobs exceed the RDMA flow ID range\n";
+            return false;
+        }
+        ringExpectedTransfers += uint64_t(job.iterations) * job.Transfers();
+        for (uint32_t rank = 0; rank < job.Ranks(); ++rank) {
             uint32_t src = job.hosts[rank];
-            uint32_t dst = job.hosts[(rank + 1) % ringRanks];
+            uint32_t dst = job.hosts[(rank + 1) % job.Ranks()];
             if (src >= n.GetN() || dst >= n.GetN() || n.Get(src)->GetNodeType() != 0 ||
                 n.Get(dst)->GetNodeType() != 0 || pairBw[n.Get(src)][n.Get(dst)] == 0) {
                 std::cerr << "Ring requires connected end hosts. Invalid edge "
                           << src << " -> " << dst << '\n';
                 return false;
             }
-            transfersPerHost[src] += uint64_t(job.iterations) * ringSteps;
+            transfersPerHost[src] += uint64_t(job.iterations) * job.Steps();
             // A ring host sends and receives the same number of transfers.
             if (transfersPerHost[src] > UINT16_MAX + 1u - portNumber[src] ||
                 transfersPerHost[src] > UINT16_MAX + 1u - dportNumber[src]) {
@@ -328,14 +610,53 @@ bool ScheduleRingJobs() {
                 return false;
             }
         }
-        ringExpectedTransfers += uint64_t(job.iterations) * ringTransfers;
-        if (ringExpectedTransfers > uint64_t(INT32_MAX) + 1) {
-            std::cerr << "Ring jobs exceed the RDMA flow ID range\n";
+    }
+    for (auto &job : ringJobs) {
+        job.nextStep.resize(job.Ranks());
+        job.ready.assign(job.Ranks(), std::vector<uint8_t>(job.Steps()));
+    }
+    for (const auto &entry : ringJobStartOffsets) {
+        if (entry.first >= ringJobs.size() ||
+            NanoSeconds(entry.second) >= Seconds(flowgen_stop_time - flowgen_start_time)) {
+            std::cerr << "Invalid RING_JOB_START_OFFSET_NS job or offset\n";
             return false;
         }
     }
+    if (figure4Trace) {
+        for (auto &job : ringJobs) {
+            for (uint32_t rank = 0; rank < job.Ranks(); ++rank) {
+                const uint32_t src = job.hosts[rank];
+                const uint32_t dst = job.hosts[(rank + 1) % job.Ranks()];
+                for (uint32_t step = 0; step < job.Steps(); ++step) {
+                    job.figure4Ports.emplace_back(portNumber[src]++, dportNumber[dst]++);
+                }
+            }
+        }
+        if (figure4Late) {
+            Simulator::Schedule(Seconds(flowgen_start_time) + MilliSeconds(500), [] {
+                std::cout << "FIGURE4_ACTIVATE time_ns=" << Simulator::Now().GetNanoSeconds()
+                          << " active_channels=" << ringActiveCollectives.size() << '\n';
+            });
+        }
+        if (figure4Trace == 2) {
+            for (const auto &sw : figure4Switches) {
+                for (uint32_t i = 0; i < sw->GetNDevices(); ++i) {
+                    auto dev = DynamicCast<QbbNetDevice>(sw->GetDevice(i));
+                    if (dev) {
+                        auto &state = figure4Egress[{sw->GetId(), dev->GetIfIndex()}];
+                        dev->TraceConnectWithoutContext("QbbDequeue",
+                            MakeBoundCallback(&TraceFigure4Egress, PeekPointer(dev), &state));
+                    }
+                }
+            }
+        }
+    }
+    if (ringEgressTrace && !ConnectRingEgressTraces()) {
+        return false;
+    }
     for (uint32_t jobId = 0; jobId < ringJobs.size(); ++jobId) {
-        Simulator::Schedule(Seconds(flowgen_start_time), &StartRingIteration, jobId);
+        Simulator::Schedule(Seconds(flowgen_start_time) + NanoSeconds(ringJobStartOffsets[jobId]),
+                            &StartRingIteration, jobId);
     }
     return true;
 }
@@ -643,6 +964,16 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
     fflush(fout);
     if (ringAllReduce) {
         CompleteRingTransfer(q);
+    } else if (symphonyTwoFlow) {
+        std::cout << "TWO_FLOW_COMPLETE step=" << q->m_ringProgress.step
+                  << " time_ns=" << Simulator::Now().GetNanoSeconds()
+                  << " bytes=" << q->m_size << '\n';
+        if (++twoFlowCompleted == 2) {
+            for (const auto &sw : symphonySwitches) {
+                sw->FinishSymphonyCollective(0);
+            }
+            Simulator::Stop();
+        }
     }
 }
 
@@ -1045,9 +1376,66 @@ int main(int argc, char *argv[]) {
                 conf >> v;
                 flow_file = v;
                 std::cerr << "FLOW_FILE\t\t\t" << flow_file << "\n";
+            } else if (key == "RING_FIGURE4") {
+                if (!(conf >> figure4Trace) || figure4Trace > 2) {
+                    std::cerr << "RING_FIGURE4 requires 0, 1 or 2\n";
+                    return 1;
+                }
+            } else if (key == "RING_FIGURE4_LATE") {
+                if (!(conf >> figure4Late)) {
+                    std::cerr << "RING_FIGURE4_LATE requires 0 or 1\n";
+                    return 1;
+                }
+            } else if (key == "SYMPHONY_TWO_FLOW") {
+                if (!(conf >> symphonyTwoFlow)) {
+                    std::cerr << "SYMPHONY_TWO_FLOW requires 0 or 1\n";
+                    return 1;
+                }
+            } else if (key == "SYMPHONY_MODE") {
+                if (!(conf >> symphonyMode) || symphonyMode > 2) {
+                    std::cerr << "SYMPHONY_MODE requires 0 (off), 1 (log), or 2 (active)\n";
+                    return 1;
+                }
+            } else if (key == "SYMPHONY_WARMUP_PACKETS") {
+                int64_t packets;
+                if (!(conf >> packets) || packets < 0 || packets > UINT32_MAX) {
+                    std::cerr << "SYMPHONY_WARMUP_PACKETS requires a nonnegative 32-bit count\n";
+                    return 1;
+                }
+                symphonyWarmup = packets;
+            } else if (key == "SYMPHONY_ADAPTIVE_ALPHA") {
+                if (!(conf >> symphonyAdaptiveAlpha)) {
+                    std::cerr << "SYMPHONY_ADAPTIVE_ALPHA requires 0 or 1\n";
+                    return 1;
+                }
+            } else if (key == "SYMPHONY_MIN_SAMPLE_PACKETS") {
+                int64_t packets;
+                if (!(conf >> packets) || packets < 0 || packets > UINT32_MAX) {
+                    std::cerr << "SYMPHONY_MIN_SAMPLE_PACKETS requires a nonnegative 32-bit count\n";
+                    return 1;
+                }
+                symphonyMinSamples = packets;
+            } else if (key == "SYMPHONY_GAIN") {
+                if (!(conf >> symphonyGain) || !(symphonyGain > 0 && symphonyGain <= 1)) {
+                    std::cerr << "SYMPHONY_GAIN requires a number in (0, 1]\n";
+                    return 1;
+                }
             } else if (key == "RING_ALL_REDUCE") {
                 if (!(conf >> ringAllReduce)) {
                     std::cerr << "RING_ALL_REDUCE requires 0 or 1\n";
+                    return 1;
+                }
+            } else if (key == "RING_EGRESS_TRACE") {
+                if (!(conf >> ringEgressTrace)) {
+                    std::cerr << "RING_EGRESS_TRACE requires 0 or 1\n";
+                    return 1;
+                }
+            } else if (key == "RING_JOB_START_OFFSET_NS") {
+                std::vector<int64_t> args;
+                if (!ReadRingArguments(conf, args) || args.size() != 2 ||
+                    args.front() > UINT32_MAX ||
+                    !ringJobStartOffsets.emplace(args[0], args[1]).second) {
+                    std::cerr << "RING_JOB_START_OFFSET_NS requires job ID and offset in ns\n";
                     return 1;
                 }
             } else if (key == "RING_CHUNK_BYTES") {
@@ -1057,31 +1445,30 @@ int main(int argc, char *argv[]) {
                     return 1;
                 }
                 ringChunkBytes = bytes;
-            } else if (key == "RING_PROCESSING_DELAY_NS") {
-                for (auto &delay : ringDelayNs) {
-                    if (!(conf >> delay) || delay < 0) {
-                        std::cerr << "RING_PROCESSING_DELAY_NS requires four nonnegative delays\n";
-                        return 1;
-                    }
-                }
-            } else if (key == "RING_JOB") {
-                RingJob job;
-                int64_t hosts[ringRanks];
-                int64_t iterations;
-                if (!(conf >> hosts[0] >> hosts[1] >> hosts[2] >> hosts[3] >> iterations) ||
-                    iterations <= 0 || iterations > UINT32_MAX) {
-                    std::cerr << "RING_JOB requires four host IDs and a positive iteration count\n";
+            } else if (key == "RING_PROCESSING_DELAY_NS" || key == "RING_JOB_DELAY_NS" ||
+                       key == "RING_JOB") {
+                std::vector<int64_t> args;
+                if (!ReadRingArguments(conf, args)) {
+                    std::cerr << key << " requires nonnegative integers\n";
                     return 1;
                 }
-                for (uint32_t rank = 0; rank < ringRanks; ++rank) {
-                    if (hosts[rank] < 0 || hosts[rank] > UINT32_MAX) {
-                        std::cerr << "RING_JOB host IDs must be nonnegative 32-bit integers\n";
-                        return 1;
-                    }
-                    job.hosts[rank] = hosts[rank];
+                if (key == "RING_PROCESSING_DELAY_NS" && !args.empty()) {
+                    ringDelayNs = std::move(args);
+                } else if (key == "RING_JOB_DELAY_NS" && args.size() >= 2 &&
+                           args.front() <= UINT32_MAX &&
+                           ringJobDelays.emplace(args.front(),
+                               std::vector<int64_t>(args.begin() + 1, args.end())).second) {
+                    // Resolve the job index after all directives have been read.
+                } else if (key == "RING_JOB" && args.size() >= 3 && args.back() > 0 &&
+                           *std::max_element(args.begin(), args.end()) <= UINT32_MAX) {
+                    RingJob job;
+                    job.hosts.assign(args.begin(), args.end() - 1);
+                    job.iterations = args.back();
+                    ringJobs.push_back(std::move(job));
+                } else {
+                    std::cerr << "Invalid arguments or duplicate job delay for " << key << '\n';
+                    return 1;
                 }
-                job.iterations = iterations;
-                ringJobs.push_back(job);
             } else if (key.compare("FLOWGEN_START_TIME") == 0) {
                 double v;
                 conf >> v;
@@ -1305,6 +1692,28 @@ int main(int argc, char *argv[]) {
     Config::SetDefault("ns3::QbbNetDevice::DynamicThreshold", BooleanValue(dynamicth));
     Config::SetDefault("ns3::QbbNetDevice::QbbEnabled", BooleanValue(enable_pfc));
 
+    if ((figure4Trace && (!ringAllReduce || enable_irn || lb_mode != 0 || cc_mode != 1 ||
+                          !enable_qcn)) || (figure4Late && (!figure4Trace || symphonyMode != 2))) {
+        std::cerr << "Figure 4 requires ring ECMP/DCQCN and IRN disabled\n";
+        return 1;
+    }
+    if (symphonyTwoFlow && (ringAllReduce || symphonyAdaptiveAlpha || enable_irn)) {
+        std::cerr << "The two-flow experiment requires fixed alpha with ring scheduling and IRN disabled\n";
+        return 1;
+    }
+    if (symphonyMode != 0 || symphonyTwoFlow) {
+        if ((!ringAllReduce && !symphonyTwoFlow) || lb_mode != 0 || cc_mode != 1 || !enable_qcn ||
+            l2_ack_interval == 0 || packet_payload_size == 0) {
+            std::cerr << "Symphony requires a ring or two-flow scenario with ECMP + DCQCN, QCN, ACKs, and positive payload size\n";
+            return 1;
+        }
+        std::cout << "SYMPHONY_CONFIG mode=" << symphonyMode << " gain=" << symphonyGain
+                  << " warmup_packets=" << symphonyWarmup
+                  << " adaptive_alpha=" << symphonyAdaptiveAlpha
+                  << " min_sample_packets=" << symphonyMinSamples << '\n';
+        RdmaHw::EnableSymphonyTrace(figure4Trace == 2 ? 10000 : figure4Trace ? 0 : UINT32_MAX);
+    }
+
     if (cc_mode != 1 && lb_mode == 9) {
         std::cout << "Currently, ConWeave supports only DCQCN congestion control for RDMA. \nIf "
                      "you want to extend, the reordering delay at DstTor must be considered."
@@ -1330,7 +1739,7 @@ int main(int argc, char *argv[]) {
     topof.open(topology_file.c_str());
     uint32_t node_num, switch_num, link_num;
     topof >> node_num >> switch_num >> link_num;
-    if (!ringAllReduce) {
+    if (!ringAllReduce && !symphonyTwoFlow) {
         flowf.open(flow_file.c_str());
         flowf >> flow_num;
     }
@@ -1357,6 +1766,18 @@ int main(int argc, char *argv[]) {
             Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
             n.Add(sw);
             sw->SetAttribute("EcnEnabled", BooleanValue(enable_qcn));
+            if (figure4Trace) {
+                const int64_t activation = Seconds(flowgen_start_time).GetNanoSeconds() +
+                                           (figure4Late ? 500000000 : 0);
+                sw->ConfigureFigure4(figure4Trace, activation);
+                sw->SetEcmpSeed(uint32_t(random_seed) * 0x9e3779b9u + sw->GetId());
+                figure4Switches.push_back(sw);
+            }
+            if (symphonyMode != 0) {
+                sw->ConfigureSymphony(symphonyMode, packet_payload_size, symphonyWarmup, symphonyGain,
+                                      symphonyAdaptiveAlpha, symphonyMinSamples);
+                symphonySwitches.push_back(sw);
+            }
         }
     }
     NS_LOG_INFO("Create nodes.");
@@ -1568,7 +1989,7 @@ int main(int argc, char *argv[]) {
             break;
         }
     }
-    if (found_topo2bdpMap == false) {
+    if (!symphonyTwoFlow && !figure4Trace && !found_topo2bdpMap) {
         std::cout << __FILE__ << "(" << __LINE__ << ")"
                   << " ERROR - topo2bdpMap has no matched item with " << topology_file << std::endl;
         assert(false);
@@ -1666,7 +2087,7 @@ int main(int argc, char *argv[]) {
         }
     }
     fprintf(stderr, "maxRtt: %lu, maxBdp: %lu\n", maxRtt, maxBdp);
-    assert(maxBdp == irn_bdp_lookup);
+    assert(symphonyTwoFlow || figure4Trace || maxBdp == irn_bdp_lookup);
 
     std::cout << "Configuring switches" << std::endl;
     /* config ToR Switch */
@@ -1924,6 +2345,10 @@ int main(int argc, char *argv[]) {
         if (!ScheduleRingJobs()) {
             return 1;
         }
+    } else if (symphonyTwoFlow) {
+        if (!ScheduleTwoFlow()) {
+            return 1;
+        }
     } else if (flow_num > 0) {
         // generate flows
         ReadFlowInput();
@@ -1981,7 +2406,7 @@ int main(int argc, char *argv[]) {
     std::cout << "Running Simulation.\n";
     fflush(stdout);
     NS_LOG_INFO("Run Simulation.");
-    if (ringAllReduce) {
+    if (ringAllReduce || symphonyTwoFlow) {
         Simulator::Stop(Seconds(flowgen_stop_time));
     } else {
         Simulator::Schedule(Seconds(flowgen_start_time),
@@ -1989,15 +2414,35 @@ int main(int argc, char *argv[]) {
         Simulator::Stop(Seconds(flowgen_stop_time + 10.0));
     }
     Simulator::Run();
+    for (const auto &entry : figure4Egress) {
+        EmitFigure4Bin(entry.first.first, entry.first.second, entry.second);
+    }
+    for (const auto &sw : figure4Switches) {
+        std::cout << "FIGURE4_MARKS switch=" << sw->GetId()
+                  << " count=" << sw->GetFigure4Marks() << '\n';
+    }
+    figure4Switches.clear();
+    for (const auto &entry : ringEgressBytes) {
+        std::cout << "RING_EGRESS bin=" << std::get<0>(entry.first)
+                  << " job=" << std::get<1>(entry.first)
+                  << " dst=" << std::get<2>(entry.first)
+                  << " bytes=" << entry.second << '\n';
+    }
+
 
     /*-----------------------------------------------------------------------------*/
     /*----- we don't need below. Just we can enforce to close this simulation. -----*/
     /*-----------------------------------------------------------------------------*/
+    symphonySwitches.clear();
     Simulator::Destroy();
     NS_LOG_INFO("Total number of packets: " << RdmaHw::nAllPkts);
     NS_LOG_INFO("Done.");
     endt = clock();
     std::cerr << (double)(endt - begint) / CLOCKS_PER_SEC << "\n";
+    if (symphonyTwoFlow && twoFlowCompleted != 2) {
+        std::cerr << "Two-flow experiment timed out before both flows finished\n";
+        return 1;
+    }
     if (ringAllReduce && ringFinishedJobs != ringJobs.size()) {
         std::cerr << "Ring timed out after " << ringCompletedTransfers << '/' << ringExpectedTransfers
                   << " transfers and " << ringFinishedJobs << '/' << ringJobs.size() << " jobs\n";

@@ -8,8 +8,8 @@ analyze/raw_basic/*
 mix/output/*
 mix/*_flow.txt
 config/*_flow.txt
-analysis/figures/*.pdf
+/analysis/figures/*
+!/analysis/figures/.keep
 **/*.pyc
 .vscode
 __pycache__
-
