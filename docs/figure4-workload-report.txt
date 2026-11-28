@@ -1,0 +1,289 @@
+SYMPHONY FIGURE 4 WORKLOAD AND FABRIC DIAGNOSTICS
+================================================
+
+Paper and upstream implementation
+----------------------------------
+Table 1 gives logical dimensions 8×4 at 32 ranks, 10 Gb/s links, and
+an 8 MB chunk described in terms of collective size divided by node
+count. Section 2.1 describes independent rails on dedicated NIC ports.
+The public paper does not specify the Figure 4 Astra-Sim version,
+optimizer branch, dataset split count, rank-to-physical-NIC mapping, or
+full event trace. The first-author listing and public artifact searches
+did not supply those inputs.
+https://arxiv.org/html/2604.16880v1#S4.SS1
+https://arxiv.org/html/2604.16880v1#S2.SS1
+https://www.unicornjin.com/
+
+Astra-Sim's GeneralComplexTopology builds one logical ring per
+dimension for the Ring implementation. The first dimension has stride
+1. Each subsequent stride is the product of the preceding dimensions.
+Astra-Sim's OneRing function instead flattens the dimensions. A rank's
+neighbors follow its configured ring direction. An 8×4 grid with
+rank ID x + 8*y has four rings of length 8 along x and eight rings of
+length 4 along y. Each rank belongs to one ring in both dimensions.
+
+Sys::generate_collective divides a rank's input into dataset streams
+based on the scheduler and preferred-dataset-splits. For each stream,
+the baseline runs the full algorithm across the selected dimensions.
+An optimized branch does reduce-scatter in ascending dimension order
+and all-gather in reverse order. Another optimized branch combines
+reduce-scatter and all-gather on the last dimension into one AllReduce
+phase. The next phase receives the previous phase's final data size.
+Streams can be queued independently and scheduling policies can change
+dimension order. The backend handles physical paths separately. Its
+ns-3 frontend passes rank IDs, message size and stream tags to send_flow.
+A logical dimension or Astra-Sim queue ID does not itself set the
+dedicated-NIC mapping of this local reconstruction.
+
+The Ring implementation sends M/N bytes per step for reduce-scatter
+or all-reduce on an N-rank ring with input M. Reduce-scatter produces
+M/N bytes. An all-gather with input M sends M bytes per step and
+produces M*N. For a simple flat ring with one stream, Table 1's 8 MB
+most naturally means the message transferred in one neighbor exchange.
+It does not establish that every phase transmits 8 MB, that 8 MB is
+Astra-Sim's stream size, or that every parallel rail carries 8 MB.
+https://github.com/astra-sim/astra-sim/blob/master/astra-sim/system/astraccl/native_collectives/logical_topology/GeneralComplexTopology.cc#L16
+https://github.com/astra-sim/astra-sim/blob/master/astra-sim/system/Sys.cc#L724
+https://github.com/astra-sim/astra-sim/blob/master/astra-sim/system/Sys.cc#L959
+https://github.com/astra-sim/astra-sim/blob/master/astra-sim/system/Sys.cc#L1119
+https://github.com/astra-sim/astra-sim/blob/master/astra-sim/system/astraccl/native_collectives/collective_algorithm/Ring.cc#L39
+https://github.com/astra-sim/astra-sim/blob/master/astra-sim/network_frontend/ns3/AstraSimNetwork.cc#L112
+
+Profile D mapping and a concrete example
+----------------------------------------
+D models one stream in the ordered optimized RS/AG decomposition.
+Each rank maps to one physical host. Let c be the final dimension's
+neighbor-transfer payload and use an application input of 32c per
+rank. These are the physical ToRs and logical coordinates.
+
+                       x=0  1  2  3  4  5  6  7
+  rack 0 / ToR 32 y=0    0  1  2  3  4  5  6  7
+  rack 1 / ToR 33 y=1    8  9 10 11 12 13 14 15
+  rack 2 / ToR 34 y=2   16 17 18 19 20 21 22 23
+  rack 3 / ToR 35 y=3   24 25 26 27 28 29 30 31
+
+Rows are rings over local NIC 0, with wraparound. Columns are rings
+over NIC 1, using ECMP via one of spines 36–39. Rank 0, for example,
+sends to 1 and receives from 7 on the first dimension. On the second
+dimension it sends to 8 and receives from 24. Two additional physical
+ports per host exist in this experiment's topology and carry no D data.
+Only one NIC per host injects cross-rack data during the fabric phases,
+so their offered access capacity per rack is 80 Gb/s into 40 Gb/s,
+even though the installed physical downlink-to-uplink ratio is 8:1.
+
+  Phase           Groups    Steps    Bytes/send  Rank output
+  local RS        4 × 8       7          4c         4c
+  fabric RS       8 × 4       3           c          c
+  fabric AG       8 × 4       3           c         4c
+  local AG        4 × 8       7          4c        32c
+
+Each subsequent step requires the predecessor transfer's final ACK and
+earlier local issue within the phase. Each phase's first send waits for
+that rank's last send and last incoming transfer from its prior phase.
+One rank can advance while unrelated ranks still finish the prior phase.
+Local final-send ACK gating is part of this ns-3 timing model. It
+approximates a rank-local phase completion event and does not duplicate
+all of Astra-Sim's stream, injection-credit or memory-bus semantics.
+The simulator models transfer timing and size. The regression test checks
+the reduction separately by tracking symbolic contributions for every
+shard through all 20 steps.
+
+With c=8 MB in this model, per host input is 256 MB. Fabric phases send
+48 MB per host and local phases send 448 MB per host. The collective
+transmits 15.872 GB of payload in 640 transfers, of which 1.536 GB and
+192 transfers cross racks. At 10 Gb/s the local NIC payload floor is
+448 MB / 1,250 MB/s = 358.4 ms. The rack-fabric payload cut gives
+1.536 GB / 20 GB/s = 76.8 ms. D assumes contiguous rack placement,
+dimension order, per-dimension NIC choice and one stream. It is a
+source-informed 8×4 experiment whose physical mapping is unverified
+against the paper.
+
+Profiles and accounting
+-----------------------
+A uses the original four flat, full-length, rack-interleaved 32-rank
+rings and the existing dedicated NIC/rail per ring. All transfers use
+the shared spine fabric along the same directed rack cycle.
+B sorts each ring by rack, retaining its within-rack order. Each ring
+still uses one dedicated NIC per host and 62 neighbor exchanges per rank,
+but only four ring edges cross racks. This preserves input and payload
+and cuts spine payload by eight.
+C uses A's routes and ranks, with the logical transfer split four ways
+across the four rails. Each rail gets c/4 per transfer. It reduces both
+application bytes and cross-rack bytes by four.
+D uses the coordinate grid and phases above. C and D have the same
+input and payload, with different dependencies, NIC usage, and routes.
+E preserves A's transfers and raises the rate of all fabric links.
+At 20/40 Gb/s per fabric link, the configured downlink:uplink ratio is
+4:1/2:1, versus 8:1 in A. Host links stay at 10 Gb/s. E retains A's
+14,000-byte send window, 11.2 us initial RTT input, and RED thresholds
+in bytes. Link-rate-derived buffer headroom follows the link model.
+Symphony and DCQCN algorithms and parameters are identical across
+treatments.
+
+At nominal c=256 KiB (all quantities are MiB):
+  Profile      Input/rank   Total input   Network payload   Cross-rack
+  A and E         32           1024              1984            1984
+  B               32           1024              1984             248
+  C                8            256               496             496
+  D                8            256               496              48
+
+The accounting utility keeps application input, per-rank network
+output, and cumulative physical port transmissions distinct. A fabric
+cut uses the maximum of the aggregate cross-rack bound and the per-rack
+ingress/egress cuts. The fixed-route data bound is the maximum of
+data wire bytes / bitrate across directional ports. Logged wire
+bounds additionally include ACK/control bytes observed on each port.
+The strict lockstep diagnostic sums the maximum data serialization
+time per step. It applies only to a global barrier at every step.
+The plan-only utility emits route-dependent fields once supplied with
+observed routes, through the runner or the archived seed-1 analysis.
+
+Archived original A at c=8,000,000 bytes:
+  dedicated NIC payload floor                     0.396800 s
+  fabric payload floor                            3.174400 s
+  aggregate fabric floor with logged wire bytes   3.517235 s
+  fixed-route busiest port, data wire bytes       3.527987 s
+  fixed-route busiest port, logged wire bytes     3.723827 s
+  strict global lockstep, data wire bytes         5.318810 s
+
+The archived packet run is 4.398623 s DCQCN and 5.531415 s Symphony.
+These are bounds on particular schedules or resources, and actual CCT
+also depends on overlap, contention, and service between dependencies.
+
+Matched 256 KiB diagnostic results
+----------------------------------
+All A–E profiles used seeds 1 and 2. At 20 Gb/s fabric rate, E used
+seed 1 as a secondary sensitivity point. Each treatment within a
+profile/seed used the same offered transfers, fixed UDP port numbers,
+initial timing rules, NIC mapping and traced forward routes. ACKs use
+the same rail endpoint and have their own ECMP hash. Endpoint traces verified both
+TX data and feedback per rail. A, C, and E also had identical forward
+routes and transport tuples across their common seeds. Timing checks
+validated every transfer against its expected earliest local release.
+In D, seed 1 DCQCN began fabric AG about 1.773 ms before the last rank
+finished fabric RS, and began local AG about 2.008 ms before the last
+fabric AG completion. Thus the phase boundary is rank-local, and the
+initial near-lockstep local phases follow from the topology.
+
+  Profile    Seed    CCT off/on (ms)      CCT change   Peak steps off/on
+  A           1     241.085 / 231.443        −4.0%           25 / 3
+  A           2     252.099 / 235.962        −6.4%           23 / 3
+  B           1      83.732 /  44.313       −47.1%           29 / 3
+  B           2     114.478 /  43.334       −62.2%           33 / 3
+  C           1      49.716 /  53.989        +8.6%           17 / 5
+  C           2      51.109 /  54.446        +6.5%           24 / 4
+  D           1      26.618 /  22.537       −15.3%            5 / 4
+  D           2      28.240 /  20.456       −27.6%            6 / 3
+  E 20G       1     135.081 / 149.063       +10.4%           35 / 3
+  E 40G       1     108.939 /  85.731       −21.3%           36 / 3
+  E 40G       2     103.627 /  84.283       −18.7%           36 / 3
+
+  Seed-1 lower bounds (ms)
+  Profile   NIC payload   Fabric wire   Fixed-route wire   Lockstep data
+  A           13.002        115.289          122.061          174.313
+  B           13.002         14.411           19.090           36.269
+  C            3.251         28.833           30.526           43.586
+  D           11.744          2.789           13.013           18.243
+  E 20G       13.002         57.645           61.030           87.156
+  E 40G       13.002         28.822           30.515           43.578
+
+The largest single-factor change in Symphony's effect was rack
+ordering (A/B), with the same offered bytes and NICs. Changing uplink
+capacity also mattered, and the E results do not support a monotonic
+oversubscription explanation. Halving the oversubscription to 4:1 made
+Symphony slower for seed 1, while reducing it to 2:1 improved the result
+for both tested seeds. Changing only chunk accounting (A/C) also
+changed the sign. D improved for both seeds, but it changes phase
+construction, ring lengths, active NICs and locality together. Its
+lower baseline peak is not directly equivalent to a peak on 62-step
+profiles, because D has only 20 logical steps.
+
+In seed 1 B, mean fabric utilization went from 17.2% to 32.5% while
+peak overlap fell from 29 to 3. In E 20G and C, utilization fell when
+Symphony reduced overlap and CCT became longer. With equal bytes,
+average utilization is the reciprocal of normalized CCT. This is
+consistent with losing useful overlap on some traffic matrices.
+It does not independently prove which specific flows lost service.
+For seed 1 A, ordinary queue marks fell from 236,761 to 92,332.
+Symphony selected 257,627 local marks, 808 during the same dequeue
+as an ordinary mark. The maximum sampled device backlog fell from
+511,424 to 199,180 bytes. The analysis reports queue marks, Symphony
+marks, and their intersection at dequeue. One packet can be marked on
+multiple hops. The queue statistic samples device backlog at TX starts
+and does not represent a time-weighted MMU occupancy.
+
+All 22 diagnostic runs passed transfer, readiness and routing checks.
+The archived 8 MB run showed a 25.8% slowdown. The newly measured A
+pairs at 256 KiB instead showed improvements. These diagnostics
+establish sensitivity to the workload and fabric, but do not assign a
+single cause to the archived slowdown or predict any full-size result.
+
+Recommendation
+--------------
+Advance D as the source-informed candidate, with C as its equal-input,
+equal-total-payload flat-ring control. Keep A as the archived case and
+B and E as locality and capacity controls. D is the only tested profile
+that implements both documented logical dimensions and conserves
+payload through a single multidimensional collective. That is the
+selection criterion. Recover the authors' phase, placement, and byte
+inputs before calling it a Figure 4 reproduction. Test at the nominal
+8 MB per inner-dimension shard only after confirming that interpretation
+or documenting it as a hypothesis. No full-size run was launched for
+this investigation.
+
+Source and reproducing
+----------------------
+  analysis/figure4_workloads.py
+      workload, manifest_text, topology, analyze.
+  analysis/run_figure4_workloads.py
+      scenario_text, inspect, run_pair, plot_and_report.
+  analysis/test_figure4_workloads.py
+      Workload, dependency, reduction and bound regressions.
+  scratch/figure4-collective.h
+      StartFigure4Transfer, ScheduleFigure4Collective,
+      CompleteFigure4Transfer. Acyclic rank-local event execution for D.
+  scratch/figure4-telemetry.h
+      Per-port dequeue mark/queue statistics and per-flow rate samples.
+  scratch/network-load-balance.cc
+      Opt-in workload setup, QP completion dispatch, and telemetry hooks.
+  src/point-to-point/model/switch-node.{h,cc}
+      Optional observer for existing mark decisions.
+  analysis/run_symphony_figure4.py
+      Relabels the NIC payload floor.
+
+Use a checkout built with the repository Dockerfile, or configure/build
+with Python-2 Waf per README.md. Run from the ns-3.19 repository root.
+The following diagnostics use a normal fresh build under build/.
+The investigation used the equivalent temporary build in
+/tmp/symphony-rails-build, linked against the checkout modules.
+
+  python3 -m unittest discover -s analysis -p test_figure4_workloads.py
+  python3 analysis/run_figure4_workloads.py --build build \
+    --output mix/output/figure4-workloads --chunk 262144 \
+    --profiles A B C D E --seeds 1 2 --workers 5
+  python3 analysis/run_figure4_workloads.py --build build \
+    --output mix/output/figure4-workloads --chunk 262144 \
+    --profiles E --seeds 1 --uplink-gbps 20
+  python3 analysis/run_figure4_workloads.py --plot-only \
+    --output mix/output/figure4-workloads --chunk 262144
+  python3 analysis/run_figure4_workloads.py --analyze-only \
+    --output mix/output/figure4-accounting --chunk 8000000
+  python3 analysis/run_figure4_workloads.py \
+    --output mix/output/figure4-accounting --chunk 8000000 \
+    --archived-summary mix/output/symphony_figure4/dedicated-rails/bytes-8000000/seed-1/off/summary.json
+
+Each run directory contains the effective config, topology, any
+executable DAG, a simulator rerun command, raw logs and a summary.
+Compare controller rates in flow-rates.csv.gz using rate_sum_bps /
+packets. The same file stores transmitted wire bytes in 1 ms bins for
+actual sending throughput. Summary JSON includes per-port utilization
+and queue/mark counters. comparison.csv reports CCT divided by both
+the fixed-route and aggregate fabric wire bounds.
+
+The saved plots and compact data are under
+analysis/figures/figure4-workload-diagnostics/bytes-262144/.
+That folder contains comparison.pdf, step-overlap.pdf, PNG copies,
+comparison.csv, and per-run summary and rate files. Raw logs, scenarios
+and exact simulator rerun scripts from this run are under
+/tmp/figure4-workload-diagnostics. The original Figure 4 results
+remain in their original paths.

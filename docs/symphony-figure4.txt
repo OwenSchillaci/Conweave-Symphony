@@ -95,3 +95,25 @@ from the measured pilot. Compact logs reduce storage and I/O but retain packet
 simulation. The sweep was limited to one full-size completed pair (seed 1).
 Figure 4(b) is a one-seed pilot ECDF. Use --seeds and --workers to extend it.
 Completed summaries are saved atomically and plots update as pairs finish.
+
+Dedicated NIC variant
+Use --dedicated-rails with analysis/run_symphony_figure4.py to select
+the four-NIC-per-host topology. The four logical rings use one NIC each
+in host-link file order and share the existing leaf-spine fabric.
+Output goes under dedicated-rails/ in the requested output directory.
+Each summary includes transmitted bytes and utilization per directional
+port over the collective interval. On dedicated access links it also
+includes data and feedback counts and checks that packets use the port
+for their rail endpoint IP. The ideal payload floor for the 8 MB
+dedicated case is 0.3968 s at 10 Gb/s per NIC.
+
+Dedicated versus shared NIC smoke test, 64 KiB, seed 1
+Layout       Symphony off CCT / peak     Symphony on CCT / peak
+Shared          49.190 ms / 26              56.401 ms / 5
+Dedicated       49.716 ms / 17              53.989 ms / 5
+
+Each run finished all 7,936 transfers, and the detailed routes matched
+between off and on within each layout. In each dedicated run all 256
+access-link endpoint ports transmitted both data and feedback. These
+short runs validate the rail wiring. They use a smaller payload than
+the full-size experiment.
