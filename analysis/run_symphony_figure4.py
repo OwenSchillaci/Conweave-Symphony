@@ -57,6 +57,7 @@ def inspect(log, chunk, mode):
     # All four channels share the same 62 logical steps, each with 128 transfers.
     events, _ = overlap_timeline(operations, 128, origin, step_count=62)
     routes, flow, last = defaultdict(dict), {}, {}
+    rail_ports = []
     packet_marks, feedback, cnps = set(), {}, set()
     corrections, first, activation = [], [], []
     marks = peak_egress = 0
@@ -69,6 +70,8 @@ def inspect(log, chunk, mode):
                 assert int(f["bytes"]) == chunk and f["collective_id"] == "0"
                 f["logical_step"] = int(f["step"]) + (31 if f["phase"] == "all-gather" else 0)
                 flow[f["flow_id"]] = f
+            elif kind == "FIGURE4_RAIL_PORT":
+                rail_ports.append({k: int(v) for k, v in fields(line).items()})
             elif kind == "FIGURE4_ROUTE":
                 f = fields(line)
                 path = routes[f["flow_id"]]
@@ -123,7 +126,7 @@ def inspect(log, chunk, mode):
                 marks=marks, traced_feedback=sum(feedback.get(uid) in cnps for uid in packet_marks),
                 first_mark_ns=min(first)-origin if first else None,
                 activation=activation, correction=corrections, witness=witness,
-                routes=routes, timeline=events)
+                routes=routes, timeline=events, rail_ports=rail_ports)
 
 
 def run(args, seed, mode):
@@ -134,7 +137,9 @@ def run(args, seed, mode):
     options = dict(RING_CHUNK_BYTES=args.chunk, RANDOM_SEED=seed,
                    RING_FIGURE4=2 if detailed else 1, RING_FIGURE4_LATE=int(mode == "late"),
                    SYMPHONY_MODE=0 if mode == "off" else 2)
-    lines = []
+    if args.dedicated_rails:
+        options["TOPOLOGY_FILE"] = "config/symphony_figure4_dedicated_topology.txt"
+    lines = ["RING_DEDICATED_RAILS 1"] if args.dedicated_rails else []
     for line in (ROOT / "config/symphony_figure4_scenario.txt").read_text().splitlines():
         key, _, value = line.partition(" ")
         if key in options:
@@ -170,6 +175,13 @@ def run(args, seed, mode):
     if proc.returncode:
         raise RuntimeError(f"Simulator failed. See {log}")
     result = inspect(log, args.chunk, mode)
+    if args.dedicated_rails:
+        active = [port for port in result["rail_ports"] if port["data"] and port["feedback"]]
+        if len(active) != 256:
+            raise ValueError("Expected data and feedback on all 256 access-link endpoints")
+    for port in result["rail_ports"]:
+        port["utilization"] = port["bytes"] * 8 / (10 * result["cct_ns"])
+    result["rail_layout"] = "dedicated" if args.dedicated_rails else "shared"
     with log.open("rb") as src, gzip.open(archive, "wb", compresslevel=2) as dst:
         shutil.copyfileobj(src, dst)
     resource["gzip_bytes"] = archive.stat().st_size
@@ -183,7 +195,7 @@ def run(args, seed, mode):
     return result
 
 
-def plot(output, chunk):
+def plot(output, chunk, dedicated_rails=False):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
@@ -213,11 +225,12 @@ def plot(output, chunk):
                 if (1, mode) in runs:
                     t, steps = zip(*runs[1, mode]["timeline"])
                     writer.writerows((mode, x, y) for x, y in zip(t, steps))
-                    ax.step([x / 1e9 for x in t], steps, where="post", label=labels[mode])
-            floor_ns = round(4 * 62 * chunk * 8 / 10_000_000_000 * 1e9)
+                    ax.step([x / 1e6 for x in t], steps, where="post", label=labels[mode])
+            floor_ns = round((1 if dedicated_rails else 4) * 62 * chunk * 8 / 10_000_000_000 * 1e9)
             writer.writerows([("payload_floor", 0, 1), ("payload_floor", floor_ns, 1)])
-            ax.plot([0, floor_ns / 1e9], [1, 1], "--", label="Ideal payload floor")
-        ax.set(xlabel="Time from collective start (s)", ylabel="Active logical steps",
+            ax.plot([0, floor_ns / 1e6], [1, 1], "--", label="Dedicated NIC payload floor" if dedicated_rails
+                    else "Shared NIC payload floor")
+        ax.set(xlabel="Time from collective start (ms)", ylabel="Active logical steps",
                title="Figure 4(a) reconstruction · seed 1")
         ax.legend()
         save(fig, folder / "figure4a")
@@ -261,6 +274,7 @@ def main():
     parser.add_argument("--chunk", type=int, default=8_000_000)
     parser.add_argument("--seeds", type=int, nargs="+", default=[1])
     parser.add_argument("--modes", nargs="+", choices=("off", "on", "late"), default=["off", "on"])
+    parser.add_argument("--dedicated-rails", action="store_true")
     parser.add_argument("--detailed", action="store_true")
     parser.add_argument("--workers", type=int, default=1)
     action = parser.add_mutually_exclusive_group()
@@ -268,6 +282,8 @@ def main():
     action.add_argument("--run-only", action="store_true")
     args = parser.parse_args()
     args.output = args.output.resolve()
+    if args.dedicated_rails:
+        args.output /= "dedicated-rails"
     if not 0 < args.chunk <= 2**32 - 1 or any(seed <= 0 for seed in args.seeds):
         parser.error("chunk and seeds must be positive; chunk is a 32-bit byte count")
     if len(set(args.seeds)) != len(args.seeds) or len(set(args.modes)) != len(args.modes):
@@ -277,7 +293,7 @@ def main():
     if any(char.isspace() for char in str(args.output)):
         parser.error("output path cannot contain whitespace")
     if args.plot_only:
-        plot(args.output, args.chunk)
+        plot(args.output, args.chunk, args.dedicated_rails)
         return
     if args.build is None:
         parser.error("--build is required unless using --plot-only")
@@ -292,7 +308,7 @@ def main():
                 if result["routes"] != expected:
                     raise ValueError("Matched flows changed paths")
             if not args.run_only:
-                plot(args.output, args.chunk)
+                plot(args.output, args.chunk, args.dedicated_rails)
 
 if __name__ == "__main__":
     main()
