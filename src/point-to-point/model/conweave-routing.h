@@ -342,6 +342,10 @@ class ConWeaveRouting : public Object {
     static uint64_t m_nReplyTailSent;      // number of reply sent
     static uint64_t m_nTimelyInitReplied;  // number of reply timely arrived at TxToR
     static uint64_t m_nTimelyTailReplied;  // number of reply timely arrived at TxToR
+    static bool m_traceProfileF;
+    static bool m_traceMarkProvenance;
+    static bool m_queueOnlyNotify;  // Profile F separated-feedback treatment
+    static bool m_traceProfileFPilotDetail;
     static uint64_t m_nNotifySent;         // number of feedback sent
     static uint64_t m_nReRoute;            // number of rerouting path by Flowcut
     static uint64_t m_nOutOfOrderPkts;     // number of OoO packets and queued at VOQ

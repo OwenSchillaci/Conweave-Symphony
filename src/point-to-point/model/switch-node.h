@@ -30,6 +30,8 @@ class SwitchNode : public Node {
 
    private:
     friend class SymphonyAlphaTest;
+    friend class SymphonyEgressTest;
+    friend class ConWeaveSharedCeTest;
 
     struct SymphonyProgress {
         uint32_t stepMin = 0;
@@ -54,7 +56,9 @@ class SwitchNode : public Node {
     uint32_t m_figure4DequeueRecords = 0;
     uint64_t m_figure4Marks = 0;
 
-    bool SymphonyMark(Ptr<Packet> p, bool queueMark);
+    bool SymphonyMark(Ptr<Packet> p, bool queueMark, uint32_t egress = 0);
+    uint32_t CountEarlierQueued(uint32_t port, uint32_t collective, uint32_t step) const;
+    static void ApplyCongestionMarks(Ptr<Packet> p, bool queueMark, bool symphonyMark);
 
     int GetOutDev(Ptr<Packet>, CustomHeader &ch);
     void SendToDev(Ptr<Packet> p, CustomHeader &ch);
@@ -92,6 +96,9 @@ class SwitchNode : public Node {
 
     static TypeId GetTypeId(void);
     SwitchNode();
+    static void PinExperimentFlow(uint32_t node, uint32_t sip, uint32_t dip,
+                                  uint16_t sport, uint16_t dport, uint32_t egress,
+                                  bool feedback);
     void SetEcmpSeed(uint32_t seed);
     void AddTableEntry(Ipv4Address &dstAddr, uint32_t intf_idx);
     void ClearTable();
@@ -99,11 +106,19 @@ class SwitchNode : public Node {
     void SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p);
     void ConfigureSymphony(uint32_t mode, uint32_t payload, uint32_t warmup, double gain,
                            bool adaptiveAlpha = true, uint32_t minSamples = 32);
+    static void SetFigure4MarkObserver(Callback<void, uint32_t, uint32_t, bool, bool> observer);
+    void SetSymphonyScopeTrace(bool enabled) { m_symphonyScopeTrace = enabled; }
+    void NotifySymphonyQueue(uint32_t port, uint32_t queue, Ptr<const Packet> p, bool enqueue);
     void ConfigureFigure4(uint32_t trace, int64_t activationNs);
     uint64_t GetFigure4Marks() const { return m_figure4Marks; }
     void StartSymphonyCollective(uint32_t collective);
     void FinishSymphonyCollective(uint32_t collective);
     uint64_t GetTxBytesOutDev(uint32_t outdev);
+
+   private:
+    bool m_symphonyScopeTrace = false;
+    // Each entry holds packets currently waiting on one port for one collective.
+    std::map<std::pair<uint32_t, uint32_t>, std::map<uint32_t, uint32_t>> m_symphonyQueued;
 };
 
 } /* namespace ns3 */

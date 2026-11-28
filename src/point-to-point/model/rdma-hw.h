@@ -59,9 +59,14 @@ class RdmaHw : public Object {
     static uint64_t GetQpKey(uint32_t dip, uint16_t sport, uint16_t dport,
                              uint16_t pg);          // get the lookup key for m_qpMap
     Ptr<RdmaQueuePair> GetQp(uint64_t key);         // get the qp
+    void BindRailAddress(Ipv4Address address, uint32_t nic) {
+        m_railNics.emplace(address.Get(), nic);
+    }
+
     uint32_t GetNicIdxOfQp(Ptr<RdmaQueuePair> qp);  // get the NIC index of the qp
     void DeleteQueuePair(Ptr<RdmaQueuePair> qp);    // delete TxQP
 
+    static void SetSymphonyScopeTrace(bool enabled);
     static void EnableSymphonyTrace(uint32_t limit = UINT32_MAX);
     void AddQueuePair(uint64_t size, uint16_t pg, Ipv4Address _sip, Ipv4Address _dip,
                       uint16_t _sport, uint16_t _dport, uint32_t win, uint64_t baseRtt,
@@ -190,6 +195,8 @@ class RdmaHw : public Object {
     Time m_irn_rtoLow;
     Time m_irn_rtoHigh;
     uint32_t m_irn_bdp;
+  private:
+    std::unordered_map<uint32_t, uint32_t> m_railNics;
 };
 
 } /* namespace ns3 */

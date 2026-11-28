@@ -181,6 +181,46 @@ std::map<uint32_t, std::vector<uint32_t>> torId2DownlinkIf;
 // input files
 std::ifstream topof, flowf;
 NodeContainer n;                         // node container
+struct RingRail {
+    Ipv4Address address;
+    uint32_t hostPort;
+    uint32_t tor;
+    uint32_t torPort;
+    std::string rate;
+};
+bool ringDedicatedRails = false;
+bool figure4WorkloadTelemetry = false;
+bool symphonyScopeTrace = false;
+bool figure4FixedWindow = false;
+std::string profileFBackgroundFile;
+bool profileFMarkProvenance = false;
+bool profileFPilotDetail = false;
+bool profileFQueueOnlyNotify = false;
+std::string figure4Manifest;
+constexpr uint32_t kRingRails = 4;
+std::vector<std::vector<RingRail>> ringRails;
+struct RailPortStats {
+    uint64_t bytes = 0;
+    uint64_t data = 0;
+    uint64_t feedback = 0;
+};
+std::map<std::pair<uint32_t, uint32_t>, RailPortStats> railPortStats;
+
+void TraceRailPort(RailPortStats *stats, Ipv4Address address, bool host,
+                   Ptr<const Packet> packet) {
+    stats->bytes += packet->GetSize();
+    if (address == Ipv4Address()) return;
+    CustomHeader header(CustomHeader::L2_Header | CustomHeader::L3_Header);
+    packet->PeekHeader(header);
+    const bool data = header.l3Prot == 0x11;
+    const bool feedback = header.l3Prot == 0xFC || header.l3Prot == 0xFD;
+    if (!(data || feedback)) return;
+    NS_ABORT_MSG_IF((host ? header.sip : header.dip) != address.Get(),
+                    "Ring packet used the wrong dedicated rail");
+    stats->data += data;
+    stats->feedback += feedback;
+}
+
 std::vector<Ipv4Address> serverAddress;  // server address
 
 // flow generator
@@ -268,6 +308,7 @@ struct Figure4EgressBin {
     int64_t bin = -1;
     uint64_t steps = 0;
     uint32_t queueMax = 0;
+    uint64_t wireBytes = 0;
     int32_t firstFlow = -1;
     int32_t otherFlow = -1;
     int64_t firstNs = 0;
@@ -277,12 +318,14 @@ struct Figure4EgressBin {
 std::map<std::pair<uint32_t, uint32_t>, Figure4EgressBin> figure4Egress;
 
 void EmitFigure4Bin(uint32_t sw, uint32_t port, const Figure4EgressBin &value) {
-    if (value.otherFlow >= 0) {
+    if (value.otherFlow >= 0 || (symphonyScopeTrace && value.steps != 0)) {
         std::cout << "FIGURE4_EGRESS switch=" << sw << " port=" << port
                   << " bin=" << value.bin << " steps=" << value.steps
                   << " queue_bytes=" << value.queueMax << " flow_a=" << value.firstFlow
                   << " flow_b=" << value.otherFlow << " time_a_ns=" << value.firstNs
-                  << " time_b_ns=" << value.otherNs << '\n';
+                  << " time_b_ns=" << value.otherNs;
+        if (symphonyScopeTrace) std::cout << " data_wire_bytes=" << value.wireBytes;
+        std::cout << '\n';
     }
 }
 
@@ -314,6 +357,7 @@ void TraceFigure4Egress(QbbNetDevice *dev, Figure4EgressBin *state,
         }
     }
     state->steps |= bit;
+    state->wireBytes += packet->GetSize();
 }
 
 bool ringEgressTrace = false;
@@ -447,6 +491,10 @@ bool ScheduleTwoFlow() {
     return true;
 }
 
+#include "figure4-collective.h"
+#include "figure4-telemetry.h"
+#include "profile-f.h"
+
 void RingStepReady(uint32_t jobId, uint32_t rank, uint32_t step) {
     auto &job = ringJobs[jobId];
     job.ready[rank][step] = true;
@@ -465,10 +513,16 @@ void RingStepReady(uint32_t jobId, uint32_t rank, uint32_t step) {
         const auto ports = figure4Trace ? job.figure4Ports[rank * job.Steps() + next]
                                         : std::make_pair(portNumber[src]++, dportNumber[dst]++);
         progress.step = next++;
+        const Ipv4Address source = ringDedicatedRails ? ringRails[src][jobId].address
+                                                     : serverAddress[src];
+        const Ipv4Address destination = ringDedicatedRails ? ringRails[dst][jobId].address
+                                                          : serverAddress[dst];
         driver->AddQueuePair(
-            ringChunkBytes, 3, serverAddress[src], serverAddress[dst], ports.first,
-            ports.second, has_win ? (global_t == 1 ? maxBdp : pairBdp[srcNode][dstNode]) : 0,
-            global_t == 1 ? maxRtt : pairRtt[srcNode][dstNode], flowId, progress);
+            ringChunkBytes, 3, source, destination, ports.first,
+            ports.second, has_win ? (figure4FixedWindow ? 14000 :
+                                     (global_t == 1 ? maxBdp : pairBdp[srcNode][dstNode])) : 0,
+            figure4FixedWindow ? 11200 : (global_t == 1 ? maxRtt : pairRtt[srcNode][dstNode]),
+            flowId, progress);
     }
 }
 
@@ -540,7 +594,7 @@ void CompleteRingTransfer(Ptr<RdmaQueuePair> q) {
                   << " duration_ns=" << (now - job.start).GetNanoSeconds() << '\n';
         if (++job.iteration < job.iterations) {
             Simulator::ScheduleNow(&StartRingIteration, jobId);
-        } else if (++ringFinishedJobs == ringJobs.size()) {
+        } else if (++ringFinishedJobs == ringJobs.size() && !profileFBackgroundPending) {
             Simulator::Stop();
         }
     }
@@ -638,18 +692,7 @@ bool ScheduleRingJobs() {
                           << " active_channels=" << ringActiveCollectives.size() << '\n';
             });
         }
-        if (figure4Trace == 2) {
-            for (const auto &sw : figure4Switches) {
-                for (uint32_t i = 0; i < sw->GetNDevices(); ++i) {
-                    auto dev = DynamicCast<QbbNetDevice>(sw->GetDevice(i));
-                    if (dev) {
-                        auto &state = figure4Egress[{sw->GetId(), dev->GetIfIndex()}];
-                        dev->TraceConnectWithoutContext("QbbDequeue",
-                            MakeBoundCallback(&TraceFigure4Egress, PeekPointer(dev), &state));
-                    }
-                }
-            }
-        }
+
     }
     if (ringEgressTrace && !ConnectRingEgressTraces()) {
         return false;
@@ -962,7 +1005,15 @@ void qp_finish(FILE *fout, Ptr<RdmaQueuePair> q) {
                   (Simulator::Now() - q->startTime).GetTimeStep(), standalone_fct));
     Settings::cnt_finished_flows++;
     fflush(fout);
-    if (ringAllReduce) {
+    if (!profileFBackgroundFile.empty() && q->m_flow_id >= profileFBackgroundId) {
+        std::cout << "PROFILE_F_BACKGROUND_COMPLETE flow_id=" << q->m_flow_id
+                  << " time_ns=" << Simulator::Now().GetNanoSeconds() << '\n';
+        if (--profileFBackgroundPending == 0 && ringFinishedJobs == ringJobs.size()) {
+            Simulator::Stop();
+        }
+    } else if (!figure4Manifest.empty()) {
+        CompleteFigure4Transfer(q);
+    } else if (ringAllReduce) {
         CompleteRingTransfer(q);
     } else if (symphonyTwoFlow) {
         std::cout << "TWO_FLOW_COMPLETE step=" << q->m_ringProgress.step
@@ -1140,6 +1191,21 @@ void SetRoutingEntries() {
         for (auto j = table.begin(); j != table.end(); j++) {
             // The destination node.
             Ptr<Node> dst = j->first;
+            if (ringDedicatedRails) {
+                for (const auto &rail : ringRails[dst->GetId()]) {
+                    auto address = rail.address;
+                    for (const auto &next : j->second) {
+                        uint32_t port = nbr2if[node][next].idx;
+                        if (node->GetNodeType() == 1) {
+                            if (next == dst) port = rail.torPort;
+                            DynamicCast<SwitchNode>(node)->AddTableEntry(address, port);
+                        } else {
+                            node->GetObject<RdmaDriver>()->m_rdma->AddTableEntry(address, port);
+                        }
+                    }
+                }
+                continue;
+            }
             // The IP address of the dst.
             Ipv4Address dstAddr = dst->GetObject<Ipv4>()->GetAddress(1, 0).GetLocal();
             // The next hops towards the dst.
@@ -1185,7 +1251,7 @@ void TakeDownLink(NodeContainer n, Ptr<Node> a, Ptr<Node> b) {
 }
 
 uint64_t get_nic_rate(NodeContainer &n) {
-    uint64_t avg_nic_rate;
+    uint64_t avg_nic_rate = 0;
     uint64_t n_servers = 0;
     for (uint32_t i = 0; i < n.GetN(); i++) {
         if (n.Get(i)->GetNodeType() == 0) {
@@ -1391,9 +1457,11 @@ int main(int argc, char *argv[]) {
                     std::cerr << "SYMPHONY_TWO_FLOW requires 0 or 1\n";
                     return 1;
                 }
+            } else if (key == "SYMPHONY_SCOPE_TRACE") {
+                if (!(conf >> symphonyScopeTrace)) return 1;
             } else if (key == "SYMPHONY_MODE") {
-                if (!(conf >> symphonyMode) || symphonyMode > 2) {
-                    std::cerr << "SYMPHONY_MODE requires 0 (off), 1 (log), or 2 (active)\n";
+                if (!(conf >> symphonyMode) || symphonyMode > 3) {
+                    std::cerr << "SYMPHONY_MODE requires 0 (off), 1 (log), 2 (original), or 3 (egress-aware)\n";
                     return 1;
                 }
             } else if (key == "SYMPHONY_WARMUP_PACKETS") {
@@ -1420,6 +1488,14 @@ int main(int argc, char *argv[]) {
                     std::cerr << "SYMPHONY_GAIN requires a number in (0, 1]\n";
                     return 1;
                 }
+            } else if (key == "PROFILE_F_QUEUE_ONLY_NOTIFY") {
+                if (!(conf >> profileFQueueOnlyNotify)) return 1;
+            } else if (key == "PROFILE_F_PILOT_DETAIL") {
+                if (!(conf >> profileFPilotDetail)) return 1;
+            } else if (key == "PROFILE_F_MARK_PROVENANCE") {
+                if (!(conf >> profileFMarkProvenance)) return 1;
+            } else if (key == "PROFILE_F_BACKGROUND") {
+                if (!(conf >> profileFBackgroundFile)) return 1;
             } else if (key == "RING_ALL_REDUCE") {
                 if (!(conf >> ringAllReduce)) {
                     std::cerr << "RING_ALL_REDUCE requires 0 or 1\n";
@@ -1568,6 +1644,14 @@ int main(int argc, char *argv[]) {
             } else if (key.compare("PFC_OUTPUT_FILE") == 0) {
                 conf >> pfc_output_file;
                 std::cerr << "PFC_OUTPUT_FILE\t\t\t\t" << pfc_output_file << '\n';
+            } else if (key == "RING_FIGURE4_MANIFEST") {
+                conf >> figure4Manifest;
+            } else if (key == "RING_FIGURE4_WORKLOAD_TELEMETRY") {
+                conf >> figure4WorkloadTelemetry;
+            } else if (key == "RING_FIGURE4_FIXED_WINDOW") {
+                conf >> figure4FixedWindow;
+            } else if (key == "RING_DEDICATED_RAILS") {
+                conf >> ringDedicatedRails;
             } else if (key.compare("LINK_DOWN") == 0) {
                 conf >> link_down_time >> link_down_A >> link_down_B;
                 std::cerr << "LINK_DOWN\t\t\t\t" << link_down_time << ' ' << link_down_A << ' '
@@ -1692,19 +1776,47 @@ int main(int argc, char *argv[]) {
     Config::SetDefault("ns3::QbbNetDevice::DynamicThreshold", BooleanValue(dynamicth));
     Config::SetDefault("ns3::QbbNetDevice::QbbEnabled", BooleanValue(enable_pfc));
 
+    if ((profileFMarkProvenance || profileFPilotDetail) && profileFBackgroundFile.empty()) {
+        std::cerr << "Profile F marking and pilot detail traces require Profile F\n";
+        return 1;
+    }
+    if (!profileFBackgroundFile.empty() &&
+        (!ringAllReduce || figure4Trace || ringDedicatedRails || symphonyTwoFlow ||
+         cc_mode != 1 || enable_irn || !enable_qcn || link_down_time > 0 ||
+         (lb_mode != 0 && lb_mode != 9) || (symphonyMode != 0 && symphonyMode != 2))) {
+        std::cerr << "Profile F requires ECMP or ConWeave with DCQCN and optional original Symphony\n";
+        return 1;
+    }
     if ((figure4Trace && (!ringAllReduce || enable_irn || lb_mode != 0 || cc_mode != 1 ||
                           !enable_qcn)) || (figure4Late && (!figure4Trace || symphonyMode != 2))) {
         std::cerr << "Figure 4 requires ring ECMP/DCQCN and IRN disabled\n";
+        return 1;
+    }
+    if ((!figure4Manifest.empty() || figure4WorkloadTelemetry || figure4FixedWindow) &&
+        (!figure4Trace || !ringDedicatedRails || figure4Late)) {
+        std::cerr << "Figure 4 workload options require dedicated rails and immediate start\n";
+        return 1;
+    }
+    if (ringDedicatedRails && (!figure4Trace || link_down_time > 0)) {
+        std::cerr << "Dedicated rails require Figure 4 without LINK_DOWN\n";
         return 1;
     }
     if (symphonyTwoFlow && (ringAllReduce || symphonyAdaptiveAlpha || enable_irn)) {
         std::cerr << "The two-flow experiment requires fixed alpha with ring scheduling and IRN disabled\n";
         return 1;
     }
+    // Profile F permits ConWeave to consume the same CE bit as the receiver.
+    const bool profileFSharedCe = !profileFBackgroundFile.empty() && lb_mode == 9 &&
+                                  symphonyMode == 2;
+    if (profileFQueueOnlyNotify && !profileFSharedCe) {
+        std::cerr << "PROFILE_F_QUEUE_ONLY_NOTIFY requires Profile F with ConWeave and original Symphony\n";
+        return 1;
+    }
     if (symphonyMode != 0 || symphonyTwoFlow) {
-        if ((!ringAllReduce && !symphonyTwoFlow) || lb_mode != 0 || cc_mode != 1 || !enable_qcn ||
-            l2_ack_interval == 0 || packet_payload_size == 0) {
-            std::cerr << "Symphony requires a ring or two-flow scenario with ECMP + DCQCN, QCN, ACKs, and positive payload size\n";
+        if ((!ringAllReduce && !symphonyTwoFlow) || (lb_mode != 0 && !profileFSharedCe) ||
+            cc_mode != 1 || !enable_qcn || l2_ack_interval == 0 || packet_payload_size == 0) {
+            std::cerr << "Symphony requires a ring or two-flow scenario with DCQCN, QCN, ACKs, "
+                         "positive payload size, and ECMP or Profile F shared CE\n";
             return 1;
         }
         std::cout << "SYMPHONY_CONFIG mode=" << symphonyMode << " gain=" << symphonyGain
@@ -1712,6 +1824,15 @@ int main(int argc, char *argv[]) {
                   << " adaptive_alpha=" << symphonyAdaptiveAlpha
                   << " min_sample_packets=" << symphonyMinSamples << '\n';
         RdmaHw::EnableSymphonyTrace(figure4Trace == 2 ? 10000 : figure4Trace ? 0 : UINT32_MAX);
+    }
+
+    if (symphonyScopeTrace && !figure4Trace) {
+        std::cerr << "Symphony scope telemetry requires Figure 4 tracing\n";
+        return 1;
+    }
+    if (symphonyScopeTrace || profileFPilotDetail) {
+        RdmaHw::SetSymphonyScopeTrace(true);
+        RdmaHw::EnableSymphonyTrace();
     }
 
     if (cc_mode != 1 && lb_mode == 9) {
@@ -1766,6 +1887,7 @@ int main(int argc, char *argv[]) {
             Ptr<SwitchNode> sw = CreateObject<SwitchNode>();
             n.Add(sw);
             sw->SetAttribute("EcnEnabled", BooleanValue(enable_qcn));
+            sw->SetSymphonyScopeTrace(symphonyScopeTrace);
             if (figure4Trace) {
                 const int64_t activation = Seconds(flowgen_start_time).GetNanoSeconds() +
                                            (figure4Late ? 500000000 : 0);
@@ -1811,6 +1933,7 @@ int main(int argc, char *argv[]) {
 
     pfc_file = fopen(pfc_output_file.c_str(), "w");
 
+    if (ringDedicatedRails) ringRails.resize(node_num);
     QbbHelper qbb;
     Ipv4AddressHelper ipv4;
     std::vector<std::pair<uint32_t, uint32_t>> link_pairs;  // src, dst link pairs
@@ -1848,12 +1971,30 @@ int main(int argc, char *argv[]) {
         // because we want our IP to be the primary IP (first in the IP address list),
         // so that the global routing is based on our IP
         NetDeviceContainer d = qbb.Install(snode, dnode);
-        if (snode->GetNodeType() == 0) {
+        if (ringDedicatedRails && (snode->GetNodeType() == 0 || dnode->GetNodeType() == 0)) {
+            const uint32_t hostEnd = snode->GetNodeType() == 0 ? 0 : 1;
+            auto hostDevice = d.Get(hostEnd);
+            auto torDevice = d.Get(1 - hostEnd);
+            const uint32_t host = hostDevice->GetNode()->GetId();
+            const uint32_t tor = torDevice->GetNode()->GetId();
+            auto &rails = ringRails[host];
+            if (torDevice->GetNode()->GetNodeType() != 1 || rails.size() >= kRingRails ||
+                (!rails.empty() && (rails.front().tor != tor || rails.front().rate != data_rate))) {
+                std::cerr << "Invalid dedicated rail layout for host " << host << '\n';
+                return 1;
+            }
+            Ipv4Address address(serverAddress[host].Get() + rails.size());
+            auto ip = hostDevice->GetNode()->GetObject<Ipv4>();
+            const auto interface = ip->AddInterface(hostDevice);
+            ip->AddAddress(interface, Ipv4InterfaceAddress(address, Ipv4Mask(0xff000000)));
+            rails.push_back({address, hostDevice->GetIfIndex(), tor, torDevice->GetIfIndex(),
+                             data_rate});
+        } else if (snode->GetNodeType() == 0) {
             Ptr<Ipv4> ipv4 = snode->GetObject<Ipv4>();
             ipv4->AddInterface(d.Get(0));
             ipv4->AddAddress(1, Ipv4InterfaceAddress(serverAddress[src], Ipv4Mask(0xff000000)));
         }
-        if (dnode->GetNodeType() == 0) {
+        if (!ringDedicatedRails && dnode->GetNodeType() == 0) {
             Ptr<Ipv4> ipv4 = dnode->GetObject<Ipv4>();
             ipv4->AddInterface(d.Get(1));
             ipv4->AddAddress(1, Ipv4InterfaceAddress(serverAddress[dst], Ipv4Mask(0xff000000)));
@@ -1900,6 +2041,13 @@ int main(int argc, char *argv[]) {
                 printf("size of serverAddress: %lu", serverAddress.size());
                 NS_FATAL_ERROR("An end-host belongs to no link");
             }
+        }
+        if (ringDedicatedRails && n.Get(i)->GetNodeType() == 0) {
+            if (ringRails[i].size() != kRingRails) {
+                std::cerr << "Expected four dedicated rails for host " << i << '\n';
+                return 1;
+            }
+            for (const auto &rail : ringRails[i]) Settings::hostIp2IdMap[rail.address.Get()] = i;
         }
         Settings::hostId2IpMap[i] = serverAddress[i].Get();
         Settings::hostIp2IdMap[serverAddress[i].Get()] = i;
@@ -1989,7 +2137,7 @@ int main(int argc, char *argv[]) {
             break;
         }
     }
-    if (!symphonyTwoFlow && !figure4Trace && !found_topo2bdpMap) {
+    if (!symphonyTwoFlow && !figure4Trace && profileFBackgroundFile.empty() && !found_topo2bdpMap) {
         std::cout << __FILE__ << "(" << __LINE__ << ")"
                   << " ERROR - topo2bdpMap has no matched item with " << topology_file << std::endl;
         assert(false);
@@ -2041,6 +2189,11 @@ int main(int argc, char *argv[]) {
 
             node->AggregateObject(rdma);
             rdma->Init();
+            if (ringDedicatedRails) {
+                for (const auto &rail : ringRails[i]) {
+                    rdmaHw->BindRailAddress(rail.address, rail.hostPort);
+                }
+            }
             rdma->TraceConnectWithoutContext("QpComplete",
                                              MakeBoundCallback(qp_finish, fct_output));
         }
@@ -2087,7 +2240,8 @@ int main(int argc, char *argv[]) {
         }
     }
     fprintf(stderr, "maxRtt: %lu, maxBdp: %lu\n", maxRtt, maxBdp);
-    assert(symphonyTwoFlow || figure4Trace || maxBdp == irn_bdp_lookup);
+    assert(symphonyTwoFlow || figure4Trace || !profileFBackgroundFile.empty() ||
+           maxBdp == irn_bdp_lookup);
 
     std::cout << "Configuring switches" << std::endl;
     /* config ToR Switch */
@@ -2341,8 +2495,17 @@ int main(int argc, char *argv[]) {
 
     flow_input.idx = 0;
     port_per_host = new uint16_t[node_num - switch_num];
-    if (ringAllReduce) {
+    if (!figure4Manifest.empty()) {
+        if (!ScheduleFigure4Collective(figure4Manifest)) {
+            std::cerr << "Invalid Figure 4 transfer manifest\n";
+            return 1;
+        }
+    } else if (ringAllReduce) {
         if (!ScheduleRingJobs()) {
+            return 1;
+        }
+        if (!profileFBackgroundFile.empty() && !ScheduleProfileFBackground()) {
+            std::cerr << "Invalid Profile F workload or missing telemetry\n";
             return 1;
         }
     } else if (symphonyTwoFlow) {
@@ -2413,7 +2576,56 @@ int main(int argc, char *argv[]) {
                             &stop_simulation_middle);  // check every 100us
         Simulator::Stop(Seconds(flowgen_stop_time + 10.0));
     }
+    if (figure4WorkloadTelemetry) {
+        SwitchNode::SetFigure4MarkObserver(MakeCallback(&Figure4MarkSample));
+    }
+    if (figure4Trace) {
+        std::map<std::pair<uint32_t, uint32_t>, Ipv4Address> accessAddresses;
+        for (uint32_t host = 0; host < ringRails.size(); ++host) {
+            for (const auto &rail : ringRails[host]) {
+                accessAddresses[{host, rail.hostPort}] = rail.address;
+                accessAddresses[{rail.tor, rail.torPort}] = rail.address;
+            }
+        }
+        for (uint32_t node = 0; node < n.GetN(); ++node) {
+            for (uint32_t port = 0; port < n.Get(node)->GetNDevices(); ++port) {
+                auto device = DynamicCast<QbbNetDevice>(n.Get(node)->GetDevice(port));
+                if (!device) continue;
+                const auto key = std::make_pair(node, port);
+                device->TraceConnectWithoutContext(
+                    "PhyTxBegin", MakeBoundCallback(&TraceRailPort, &railPortStats[key],
+                                                    accessAddresses[key],
+                                                    n.Get(node)->GetNodeType() == 0));
+                if (figure4Trace == 2 && n.Get(node)->GetNodeType() == 1) {
+                    device->TraceConnectWithoutContext("QbbDequeue",
+                        MakeBoundCallback(&TraceFigure4Egress, PeekPointer(device), &figure4Egress[key]));
+                }
+                if (figure4WorkloadTelemetry) {
+                    if (n.Get(node)->GetNodeType() == 0) {
+                        device->TraceConnectWithoutContext("RdmaQpDequeue",
+                                                           MakeCallback(&Figure4RateSample));
+                    } else {
+                        device->TraceConnectWithoutContext("PhyTxBegin",
+                            MakeBoundCallback(&Figure4QueueSample, PeekPointer(device)));
+                    }
+                }
+            }
+        }
+    }
     Simulator::Run();
+    if (!profileFBackgroundFile.empty()) {
+        PrintProfileFTelemetry();
+    }
+    if (figure4WorkloadTelemetry) {
+        PrintFigure4Telemetry();
+        SwitchNode::SetFigure4MarkObserver(Callback<void, uint32_t, uint32_t, bool, bool>());
+    }
+    for (const auto &entry : railPortStats) {
+        std::cout << "FIGURE4_RAIL_PORT node=" << entry.first.first
+                  << " port=" << entry.first.second << " bytes=" << entry.second.bytes
+                  << " data=" << entry.second.data << " feedback=" << entry.second.feedback
+                  << '\n';
+    }
     for (const auto &entry : figure4Egress) {
         EmitFigure4Bin(entry.first.first, entry.first.second, entry.second);
     }
@@ -2439,11 +2651,19 @@ int main(int argc, char *argv[]) {
     NS_LOG_INFO("Done.");
     endt = clock();
     std::cerr << (double)(endt - begint) / CLOCKS_PER_SEC << "\n";
+    if (profileFBackgroundPending) {
+        std::cerr << "Profile F background transfers timed out\n";
+        return 1;
+    }
     if (symphonyTwoFlow && twoFlowCompleted != 2) {
         std::cerr << "Two-flow experiment timed out before both flows finished\n";
         return 1;
     }
-    if (ringAllReduce && ringFinishedJobs != ringJobs.size()) {
+    if (!figure4Manifest.empty() && figure4Completed != figure4Transfers.size()) {
+        std::cerr << "Figure 4 manifest timed out after " << figure4Completed << " transfers\n";
+        return 1;
+    }
+    if (figure4Manifest.empty() && ringAllReduce && ringFinishedJobs != ringJobs.size()) {
         std::cerr << "Ring timed out after " << ringCompletedTransfers << '/' << ringExpectedTransfers
                   << " transfers and " << ringFinishedJobs << '/' << ringJobs.size() << " jobs\n";
         return 1;

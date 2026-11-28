@@ -43,7 +43,14 @@ void ConWeaveVOQ::Set(uint64_t flowkey, uint32_t dip, Time timeToFlush, Time ext
     RescheduleFlush(timeToFlush);
 }
 
-void ConWeaveVOQ::Enqueue(Ptr<Packet> pkt) { m_FIFO.push(pkt); }
+static std::unordered_map<const Packet *, Time> g_profileFEnqueueTime;
+
+void ConWeaveVOQ::Enqueue(Ptr<Packet> pkt) {
+    if (ConWeaveRouting::m_traceProfileF) {
+        g_profileFEnqueueTime.emplace(PeekPointer(pkt), Simulator::Now());
+    }
+    m_FIFO.push(pkt);
+}
 
 void ConWeaveVOQ::FlushAllImmediately() {
     m_CallbackByVOQFlush(
@@ -54,6 +61,14 @@ void ConWeaveVOQ::FlushAllImmediately() {
         CustomHeader ch(CustomHeader::L2_Header | CustomHeader::L3_Header |
                         CustomHeader::L4_Header);
         pkt->PeekHeader(ch);
+        if (ConWeaveRouting::m_traceProfileF) {
+            auto queued = g_profileFEnqueueTime.find(PeekPointer(pkt));
+            NS_ASSERT(queued != g_profileFEnqueueTime.end());
+            std::cout << "PROFILE_F_VOQ time_ns=" << Simulator::Now().GetNanoSeconds()
+                      << " residence_ns=" << (Simulator::Now() - queued->second).GetNanoSeconds()
+                      << " flow_key=" << m_flowkey << " uid=" << pkt->GetUid() << '\n';
+            g_profileFEnqueueTime.erase(queued);
+        }
         m_switchSendToDevCallback(pkt, ch);  // SlbRouting::DoSwitchSendToDev
         m_FIFO.pop();                        // remove this element
     }

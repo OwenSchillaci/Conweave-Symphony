@@ -26,6 +26,7 @@ def build(bld):
 		'model/conga-routing.cc',
         'model/letflow-routing.cc',
         'model/conweave-routing.cc',
+        'model/ecn-mark-provenance-tag.cc',
         'model/conweave-voq.cc',
 		'helper/selective-packet-queue.cc',
         ]
@@ -63,6 +64,7 @@ def build(bld):
 		'model/conga-routing.h',
         'model/letflow-routing.h',
         'model/conweave-routing.h',
+        'model/ecn-mark-provenance-tag.h',
         'model/conweave-voq.h',
 		'helper/selective-packet-queue.h',
         ]

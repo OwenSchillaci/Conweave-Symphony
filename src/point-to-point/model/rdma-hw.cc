@@ -157,6 +157,8 @@ void RdmaHw::Setup(QpCompleteCallback cb) {
 }
 
 uint32_t RdmaHw::GetNicIdxOfQp(Ptr<RdmaQueuePair> qp) {
+    auto rail = m_railNics.find(qp->sip.Get());
+    if (rail != m_railNics.end()) return rail->second;
     auto &v = m_rtTable[qp->dip.Get()];
     if (v.size() > 0) {
         return v[qp->GetHash() % v.size()];
@@ -275,6 +277,8 @@ Ptr<RdmaRxQueuePair> RdmaHw::GetRxQp(uint32_t sip, uint32_t dip, uint16_t sport,
     return NULL;
 }
 uint32_t RdmaHw::GetNicIdxOfRxQp(Ptr<RdmaRxQueuePair> q) {
+    auto rail = m_railNics.find(q->sip);
+    if (rail != m_railNics.end()) return rail->second;
     auto &v = m_rtTable[q->dip];
     if (v.size() > 0) {
         return v[q->GetHash() % v.size()];
@@ -295,6 +299,10 @@ void RdmaHw::DeleteRxQp(uint32_t dip, uint16_t dport, uint16_t sport, uint16_t p
     // delete
     m_rxQpMap.erase(key);
 }
+
+static bool g_symphonyScopeTrace = false;
+
+void RdmaHw::SetSymphonyScopeTrace(bool enabled) { g_symphonyScopeTrace = enabled; }
 
 static uint32_t g_symphonyTraceLimit = 0;
 static uint32_t g_symphonyFeedback = 0;
@@ -573,8 +581,9 @@ int RdmaHw::ReceiveAck(Ptr<Packet> p, CustomHeader &ch) {
                 ++g_symphonyCnp;
                 std::cout << "SYMPHONY_CNP time_ns=" << Simulator::Now().GetNanoSeconds()
                           << " sender=" << m_node->GetId() << " ack_uid=" << p->GetUid()
-                          << " flow_id=" << qp->m_flow_id << " finished=" << qp->IsFinished()
-                          << '\n';
+                          << " flow_id=" << qp->m_flow_id << " finished=" << qp->IsFinished();
+                if (g_symphonyScopeTrace) std::cout << " tx_payload_bytes=" << qp->stat.txTotalBytes;
+                std::cout << '\n';
             }
             cnp_received_mlx(qp);
         }
@@ -1021,7 +1030,14 @@ void RdmaHw::ScheduleDecreaseRateMlx(Ptr<RdmaQueuePair> q, uint32_t delta) {
 void RdmaHw::RateIncEventTimerMlx(Ptr<RdmaQueuePair> q) {
     q->mlx.m_rpTimer =
         Simulator::Schedule(MicroSeconds(m_rpgTimeReset), &RdmaHw::RateIncEventTimerMlx, this, q);
+    const uint64_t before = q->m_rate.GetBitRate();
     RateIncEventMlx(q);
+    if (g_symphonyScopeTrace && before != q->m_rate.GetBitRate()) {
+        std::cout << "SYMPHONY_RECOVERY time_ns=" << Simulator::Now().GetNanoSeconds()
+                  << " flow_id=" << q->m_flow_id << " stage=" << q->mlx.m_rpTimeStage
+                  << " before_bps=" << before << " after_bps=" << q->m_rate.GetBitRate()
+                  << " tx_payload_bytes=" << q->stat.txTotalBytes << '\n';
+    }
     q->mlx.m_rpTimeStage++;
 }
 void RdmaHw::RateIncEventMlx(Ptr<RdmaQueuePair> q) {

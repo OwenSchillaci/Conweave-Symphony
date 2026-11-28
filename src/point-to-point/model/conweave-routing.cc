@@ -19,6 +19,7 @@
  */
 
 #include "ns3/conweave-routing.h"
+#include "ecn-mark-provenance-tag.h"
 
 #include <assert.h>
 #include <stdio.h>
@@ -29,6 +30,7 @@
 #include "ns3/assert.h"
 #include "ns3/event-id.h"
 #include "ns3/flow-id-tag.h"
+#include "ns3/flow-id-num-tag.h"
 #include "ns3/ipv4-header.h"
 #include "ns3/log.h"
 #include "ns3/nstime.h"
@@ -161,6 +163,14 @@ uint64_t ConWeaveRouting::m_nReplyInitSent = 0;
 uint64_t ConWeaveRouting::m_nReplyTailSent = 0;
 uint64_t ConWeaveRouting::m_nTimelyInitReplied = 0;
 uint64_t ConWeaveRouting::m_nTimelyTailReplied = 0;
+bool ConWeaveRouting::m_traceProfileF = false;
+bool ConWeaveRouting::m_traceMarkProvenance = false;
+bool ConWeaveRouting::m_queueOnlyNotify = false;
+bool ConWeaveRouting::m_traceProfileFPilotDetail = false;
+
+// Only used for tracing. A candidate consults this index after the live table
+// has already classified it as excluded.
+static std::map<const ConWeaveRouting *, std::map<uint32_t, uint64_t>> g_exclusionNotify;
 uint64_t ConWeaveRouting::m_nNotifySent = 0;
 uint64_t ConWeaveRouting::m_nReRoute = 0;
 uint64_t ConWeaveRouting::m_nOutOfOrderPkts = 0;
@@ -184,7 +194,9 @@ ConWeaveRouting::ConWeaveRouting() {
     m_conweavePathTable.resize(65536);            // initialize table size
 }
 
-ConWeaveRouting::~ConWeaveRouting() {}
+ConWeaveRouting::~ConWeaveRouting() {
+    g_exclusionNotify.erase(this);
+}
 void ConWeaveRouting::DoDispose() { m_agingEvent.Cancel(); }
 TypeId ConWeaveRouting::GetTypeId(void) {
     static TypeId tid =
@@ -352,6 +364,19 @@ void ConWeaveRouting::SendNotify(Ptr<Packet> p, CustomHeader &ch, uint32_t pathI
 
     /** OVERHEAD: reply overhead statistics **/
     ConWeaveRouting::m_nNotifySent += 1;
+    if (m_traceProfileF) {
+        std::cout << "PROFILE_F_NOTIFY time_ns=" << Simulator::Now().GetNanoSeconds()
+                  << " switch=" << m_switch_id << " path=" << pathId
+                  << " sip=" << ch.sip << " dip=" << ch.dip
+                  << " sport=" << ch.udp.sport << " dport=" << ch.udp.dport << '\n';
+    }
+
+    if (m_traceMarkProvenance) {
+        std::cout << "CW_PROV_NOTIFY time_ns=" << Simulator::Now().GetNanoSeconds()
+                  << " switch=" << m_switch_id << " path=" << pathId
+                  << " data_uid=" << p->GetUid() << " notify_uid=" << fbP->GetUid()
+                  << " causes=" << unsigned(EcnMarkProvenanceTag::Read(p)) << '\n';
+    }
 
     // send notify packets
     SLB_LOG(PARSE_FIVE_TUPLE(ch) << "================================### Send NOTIFY");
@@ -528,6 +553,8 @@ void ConWeaveRouting::RouteInput(Ptr<Packet> p, CustomHeader &ch) {
                 *(std::next(pathSet.begin(),
                             rand() % pathSet.size()));  // to initialize (empty: CW_DEFAULT_32BIT)
 
+            const bool traceDecision = m_traceMarkProvenance &&
+                                       (tx_md.flagExpired || tx_md.flagReplyTimeout);
             if (m_pathAwareRerouting) {
                 /* path-aware decision */
                 uint32_t randPath1 = *(std::next(pathSet.begin(), rand() % pathSet.size()));
@@ -564,12 +591,28 @@ void ConWeaveRouting::RouteInput(Ptr<Packet> p, CustomHeader &ch) {
                     // SLB_LOG(PARSE_FIVE_TUPLE(ch) << "--> Cannot find good path, so use current
                     // path");
                 }
+                if (traceDecision) {
+                    const auto &notify = g_exclusionNotify[this];
+                    const auto notify1 = notify.find(randPath1);
+                    const auto notify2 = notify.find(randPath2);
+                    std::cout << "CW_PROV_CANDIDATES time_ns=" << now.GetNanoSeconds()
+                              << " switch=" << m_switch_id << " decision_uid=" << p->GetUid()
+                              << " first=" << randPath1 << " first_usable=" << goodPath1
+                              << " first_notify_uid=" << (goodPath1 || notify1 == notify.end()
+                                  ? "none" : std::to_string(notify1->second))
+                              << " second=" << randPath2 << " second_usable=" << goodPath2
+                              << " second_notify_uid=" << (goodPath2 || notify2 == notify.end()
+                                  ? "none" : std::to_string(notify2->second))
+                              << " selected=" << tx_md.goodPath
+                              << " found=" << tx_md.foundGoodPath << '\n';
+                }
             } else {
                 /* random path selection */
                 tx_md.foundGoodPath = true;
                 tx_md.goodPath = *(std::next(pathSet.begin(), rand() % pathSet.size()));
             }
 
+            const uint32_t previousPath = txEntry._pathId;
             /** PATH: update and get current path */
             /** NOTE: if new connection, set initial random path */
             if (txEntry._pathId == CW_DEFAULT_32BIT) {
@@ -597,6 +640,35 @@ void ConWeaveRouting::RouteInput(Ptr<Packet> p, CustomHeader &ch) {
                 }
             } else { /* stabilized or usual -> use current path and do not change the path */
                 tx_md.currPath = txEntry._pathId;
+            }
+
+            if (m_traceProfileF && !tx_md.newConnection &&
+                (tx_md.flagExpired || tx_md.flagReplyTimeout)) {
+                FlowIDNUMTag flow;
+                const int32_t id = p->PeekPacketTag(flow) ? flow.GetId() : -1;
+                std::cout << "PROFILE_F_PATH time_ns=" << now.GetNanoSeconds()
+                          << " flow_id=" << id << " epoch=" << tx_md.epoch
+                          << " new_phase=" << txEntry._phase
+                          << " switch=" << m_switch_id << " old=" << previousPath
+                          << " new=" << txEntry._pathId << " timeout=" << tx_md.flagReplyTimeout
+                          << " changed=" << (previousPath != txEntry._pathId)
+                          << " sip=" << ch.sip << " dip=" << ch.dip
+                          << " sport=" << ch.udp.sport << " dport=" << ch.udp.dport << '\n';
+            }
+
+            if (traceDecision) {
+                FlowIDNUMTag flow;
+                const int32_t id = p->PeekPacketTag(flow) ? flow.GetId() : -1;
+                std::cout << "CW_PROV_PATH time_ns=" << now.GetNanoSeconds()
+                          << " switch=" << m_switch_id << " decision_uid=" << p->GetUid()
+                          << " flow_id=" << id << " epoch=" << tx_md.epoch
+                          << " phase=" << txEntry._phase << " old=" << previousPath
+                          << " new=" << txEntry._pathId << " this_packet_path=" << tx_md.currPath
+                          << " new_port=" << GetOutPortFromPath(txEntry._pathId, 0)
+                          << " initial=" << tx_md.newConnection
+                          << " timeout=" << tx_md.flagReplyTimeout
+                          << " changed=" << (!tx_md.newConnection && previousPath != txEntry._pathId)
+                          << '\n';
             }
 
             /** TAILTIME: Memorize TAIL packet timestamp or get if phase=1 */
@@ -684,6 +756,18 @@ void ConWeaveRouting::RouteInput(Ptr<Packet> p, CustomHeader &ch) {
                     rx_md.resultEpochMatch = 2;
                 } else { /* current epoch */
                     rx_md.resultEpochMatch = 0;
+                }
+
+                if (m_traceMarkProvenance) {
+                    FlowIDNUMTag flow;
+                    const int32_t id = p->PeekPacketTag(flow) ? flow.GetId() : -1;
+                    std::cout << "CW_PROV_RX time_ns=" << now.GetNanoSeconds()
+                              << " switch=" << m_switch_id << " data_uid=" << p->GetUid()
+                              << " flow_id=" << id << " path=" << rx_md.pkt_pathId
+                              << " epoch=" << rx_md.pkt_epoch << " phase=" << rx_md.pkt_phase
+                              << " ecn=" << unsigned(rx_md.pkt_ecnbits)
+                              << " causes=" << unsigned(EcnMarkProvenanceTag::Read(p))
+                              << " old_epoch=" << (rx_md.resultEpochMatch == 2) << '\n';
                 }
 
                 /** FILTER: if previous epoch, just pass to destination */
@@ -854,6 +938,12 @@ void ConWeaveRouting::RouteInput(Ptr<Packet> p, CustomHeader &ch) {
                                 : 0;
                         voq->second.RescheduleFlush(
                             NanoSeconds(rx_md.timeExpectedToFlush)); /* new deadline */
+                        if (m_traceProfileFPilotDetail) {
+                            std::cout << "CW_PILOT_VOQ_ARM time_ns=" << now.GetNanoSeconds()
+                                      << " flow_key=" << rx_md.pkt_flowkey
+                                      << " tail=" << (rx_md.pkt_flagData == ConWeaveDataTag::TAIL)
+                                      << " delay_ns=" << rx_md.timeExpectedToFlush << '\n';
+                        }
                         SLB_LOG(PARSE_FIVE_TUPLE(ch)
                                 << "--> Phase 0 while OoO"
                                 << ",VOQ size:" << voq->second.getQueueSize() + 1
@@ -885,6 +975,11 @@ void ConWeaveRouting::RouteInput(Ptr<Packet> p, CustomHeader &ch) {
                             voq.Set(rx_md.pkt_flowkey, ch.dip,
                                     NanoSeconds(rx_md.timeExpectedToFlush),
                                     m_extraVOQFlushTime); /* new deadline */
+                            if (m_traceProfileFPilotDetail) {
+                                std::cout << "CW_PILOT_VOQ_ARM time_ns=" << now.GetNanoSeconds()
+                                          << " flow_key=" << rx_md.pkt_flowkey
+                                          << " tail=0 delay_ns=" << rx_md.timeExpectedToFlush << '\n';
+                            }
                             voq.m_deleteCallback = MakeCallback(&ConWeaveRouting::DeleteVOQ, this);
                             voq.m_CallbackByVOQFlush =
                                 MakeCallback(&ConWeaveRouting::CallbackByVOQFlush, this);
@@ -907,7 +1002,9 @@ void ConWeaveRouting::RouteInput(Ptr<Packet> p, CustomHeader &ch) {
                  * NOTIFY: Generate NOTIFY packet if ECN marked
                  */
                 if (m_pathAwareRerouting) {
-                    if (rx_md.pkt_ecnbits == 0x03) {
+                    if (rx_md.pkt_ecnbits == 0x03 &&
+                        (!m_queueOnlyNotify ||
+                         (EcnMarkProvenanceTag::Read(p) & EcnMarkProvenanceTag::Queue))) {
                         SendNotify(p, ch, rx_md.pkt_pathId);
                     }
                 }
@@ -1004,6 +1101,18 @@ void ConWeaveRouting::RouteInput(Ptr<Packet> p, CustomHeader &ch) {
                      */
                     pathEntry._pathId = congestedPathId;
                     pathEntry._invalidTime = now + m_pathPauseTime;
+                    if (m_traceMarkProvenance) {
+                        g_exclusionNotify[this][congestedPathId] = p->GetUid();
+                        std::cout << "CW_PROV_EXCLUDE time_ns=" << now.GetNanoSeconds()
+                                  << " switch=" << m_switch_id << " path=" << congestedPathId
+                                  << " notify_uid=" << p->GetUid()
+                                  << " until_ns=" << pathEntry._invalidTime.GetNanoSeconds() << '\n';
+                    }
+                    if (m_traceProfileF) {
+                        std::cout << "PROFILE_F_EXCLUDE time_ns=" << now.GetNanoSeconds()
+                                  << " switch=" << m_switch_id << " path=" << congestedPathId
+                                  << " until_ns=" << pathEntry._invalidTime.GetNanoSeconds() << '\n';
+                    }
                     return;  // drop this NOTIFY
                 }
             }

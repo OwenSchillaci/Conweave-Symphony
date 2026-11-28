@@ -51,6 +51,7 @@
 #include "ns3/rdma-hw.h"
 #include "ns3/seq-ts-header.h"
 #include "ns3/settings.h"
+#include "ns3/switch-node.h"
 #include "ns3/simulator.h"
 #include "ns3/udp-header.h"
 #include "ns3/uinteger.h"
@@ -403,7 +404,10 @@ bool QbbNetDevice::Send(Ptr<Packet> packet, const Address &dest, uint16_t protoc
 bool QbbNetDevice::SwitchSend(uint32_t qIndex, Ptr<Packet> packet, CustomHeader &ch) {
     m_macTxTrace(packet);
     m_traceEnqueue(packet, qIndex);
-    m_queue->Enqueue(packet, qIndex);
+    if (m_queue->Enqueue(packet, qIndex) && qIndex != 0) {
+        auto sw = DynamicCast<SwitchNode>(m_node);
+        if (sw) sw->NotifySymphonyQueue(m_ifIndex, qIndex, packet, true);
+    }
     DequeueAndTransmit();
     return true;
 }
@@ -498,6 +502,8 @@ void QbbNetDevice::TakeDown() {
         while (1) {
             Ptr<Packet> p = m_queue->DequeueRR(m_paused);
             if (p == 0) break;
+            auto sw = DynamicCast<SwitchNode>(m_node);
+            if (sw) sw->NotifySymphonyQueue(m_ifIndex, m_queue->GetLastQueue(), p, false);
             m_traceDrop(p, m_queue->GetLastQueue());
         }
         // TODO: Notify switch that this link is down

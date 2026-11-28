@@ -1,6 +1,7 @@
 #include "switch-node.h"
 
 #include "assert.h"
+#include "ecn-mark-provenance-tag.h"
 #include "ns3/boolean.h"
 #include "ns3/conweave-routing.h"
 #include "ns3/double.h"
@@ -206,7 +207,29 @@ bool SwitchNode::SwitchReceiveFromDevice(Ptr<NetDevice> device, Ptr<Packet> pack
     return true;
 }
 
+using ExperimentFlow = std::tuple<uint32_t, uint32_t, uint32_t, uint16_t, uint16_t, bool>;
+static std::map<ExperimentFlow, uint32_t> g_experimentRoutes;
+
+void SwitchNode::PinExperimentFlow(uint32_t node, uint32_t sip, uint32_t dip,
+                                   uint16_t sport, uint16_t dport, uint32_t egress,
+                                   bool feedback) {
+    g_experimentRoutes.emplace(ExperimentFlow(node, sip, dip, sport, dport, feedback), egress);
+}
+
 void SwitchNode::SendToDev(Ptr<Packet> p, CustomHeader &ch) {
+    if (!g_experimentRoutes.empty()) {
+        const bool feedback = ch.l3Prot == 0xFC || ch.l3Prot == 0xFD;
+        if (feedback || ch.l3Prot == 0x11) {
+            const auto route = g_experimentRoutes.find(ExperimentFlow(
+                GetId(), ch.sip, ch.dip,
+                feedback ? ch.ack.sport : ch.udp.sport,
+                feedback ? ch.ack.dport : ch.udp.dport, feedback));
+            if (route != g_experimentRoutes.end()) {
+                DoSwitchSend(p, ch, route->second, feedback ? 0 : ch.udp.pg);
+                return;
+            }
+        }
+    }
     /** HIJACK: hijack the packet and run DoSwitchSend internally for Conga and ConWeave.
      * Note that DoLbConWeave() and DoLbConga() are flow-ECMP function for control packets
      * or intra-ToR traffic.
@@ -353,6 +376,12 @@ void SwitchNode::ConfigureSymphony(uint32_t mode, uint32_t payload, uint32_t war
     m_symphonyRandom->SetStream(100000 + GetId());
 }
 
+static Callback<void, uint32_t, uint32_t, bool, bool> g_figure4MarkObserver;
+
+void SwitchNode::SetFigure4MarkObserver(Callback<void, uint32_t, uint32_t, bool, bool> observer) {
+    g_figure4MarkObserver = observer;
+}
+
 void SwitchNode::ConfigureFigure4(uint32_t trace, int64_t activationNs) {
     m_figure4Trace = trace;
     m_figure4ActivationNs = activationNs;
@@ -364,9 +393,48 @@ void SwitchNode::StartSymphonyCollective(uint32_t collective) {
 
 void SwitchNode::FinishSymphonyCollective(uint32_t collective) {
     m_symphonyProgress.erase(collective);
+    for (auto it = m_symphonyQueued.begin(); it != m_symphonyQueued.end();) {
+        if (it->first.second == collective) {
+            it = m_symphonyQueued.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
-bool SwitchNode::SymphonyMark(Ptr<Packet> p, bool queueMark) {
+void SwitchNode::NotifySymphonyQueue(uint32_t port, uint32_t queue, Ptr<const Packet> p,
+                                     bool enqueue) {
+    if ((!m_symphonyScopeTrace && m_symphonyMode != 3) || queue == 0) return;
+    RingProgressTag tag;
+    if (!p->PeekPacketTag(tag)) return;
+    const auto progress = tag.GetProgress();
+    const auto key = std::make_pair(port, progress.collectiveId);
+    if (enqueue) {
+        if (m_symphonyMode == 0 || m_symphonyProgress.count(progress.collectiveId)) {
+            ++m_symphonyQueued[key][progress.step];
+        }
+        return;
+    }
+    auto portJob = m_symphonyQueued.find(key);
+    if (portJob == m_symphonyQueued.end()) return;
+    auto step = portJob->second.find(progress.step);
+    if (step == portJob->second.end()) return;
+    if (--step->second == 0) portJob->second.erase(step);
+    if (portJob->second.empty()) m_symphonyQueued.erase(portJob);
+}
+
+uint32_t SwitchNode::CountEarlierQueued(uint32_t port, uint32_t collective, uint32_t step) const {
+    const auto portJob = m_symphonyQueued.find({port, collective});
+    if (portJob == m_symphonyQueued.end()) return 0;
+    uint32_t count = 0;
+    for (const auto &entry : portJob->second) {
+        if (entry.first >= step) break;
+        count += entry.second;
+    }
+    return count;
+}
+
+bool SwitchNode::SymphonyMark(Ptr<Packet> p, bool queueMark, uint32_t egress) {
     RingProgressTag ring;
     if (!p->PeekPacketTag(ring)) {
         return false;
@@ -452,7 +520,11 @@ bool SwitchNode::SymphonyMark(Ptr<Packet> p, bool queueMark) {
         ? std::min(1.0, m_symphonyGain * progress.alpha * psn / progress.psnRec) : 0.0;
     const double draw = eligible ? m_symphonyRandom->GetValue() : 1.0;
     const bool selected = eligible && draw < probability;
-    const bool symphonyMark = m_symphonyMode == 2 && selected;
+    const uint32_t earlierQueued =
+        selected && (m_symphonyMode == 3 || m_symphonyScopeTrace)
+            ? CountEarlierQueued(egress, collective, step) : 0;
+    const bool gate = m_symphonyMode != 3 || earlierQueued > 0;
+    const bool symphonyMark = m_symphonyMode >= 2 && selected && gate;
     if (m_figure4Trace && symphonyMark) {
         if (++m_figure4Marks == 1) {
             std::cout << "FIGURE4_FIRST_MARK switch=" << GetId() << " time_ns=" << now
@@ -461,7 +533,7 @@ bool SwitchNode::SymphonyMark(Ptr<Packet> p, bool queueMark) {
     }
     const bool detailed = m_figure4Trace == 2 && m_figure4DequeueRecords < 10000 &&
                           (symphonyMark || last || step < previousStep);
-    if (detailed || (!m_figure4Trace && (outpacing || last || step < previousStep || queueMark))) {
+    if ((m_symphonyScopeTrace && selected) || detailed || (!m_figure4Trace && (outpacing || last || step < previousStep || queueMark))) {
         ++m_figure4DequeueRecords;
         const int32_t flowId = p->PeekPacketTag(flow) ? flow.GetId() : -1;
         const char *cause = symphonyMark ? (queueMark ? "both" : "symphony")
@@ -473,12 +545,29 @@ bool SwitchNode::SymphonyMark(Ptr<Packet> p, bool queueMark) {
                   << " previous_step_min=" << previousStep << " step_min=" << progress.stepMin
                   << " psn_rec=" << progress.psnRec << " outpacing=" << outpacing
                   << " alpha=" << progress.alpha << " eligible=" << eligible << " probability=" << probability
-                  << " draw=" << draw << " selected=" << selected << " mark=" << cause << '\n';
+                  << " draw=" << draw << " selected=" << selected;
+        if (m_symphonyScopeTrace) {
+            std::cout << " egress=" << egress << " earlier_queued=" << earlierQueued
+                      << " gate=" << gate;
+        }
+        std::cout << " mark=" << cause << '\n';
     }
     return symphonyMark;
 }
 
+void SwitchNode::ApplyCongestionMarks(Ptr<Packet> p, bool queueMark, bool symphonyMark) {
+    if (!queueMark && !symphonyMark) return;
+    PppHeader ppp;
+    Ipv4Header h;
+    p->RemoveHeader(ppp);
+    p->RemoveHeader(h);
+    h.SetEcn((Ipv4Header::EcnType)0x03);
+    p->AddHeader(h);
+    p->AddHeader(ppp);
+}
+
 void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Packet> p) {
+    NotifySymphonyQueue(ifIndex, qIndex, p, false);
     FlowIdTag t;
     p->PeekPacketTag(t);
     if (qIndex != 0) {
@@ -490,16 +579,25 @@ void SwitchNode::SwitchNotifyDequeue(uint32_t ifIndex, uint32_t qIndex, Ptr<Pack
         }
         m_mmu->RemoveFromEgressAdmission(ifIndex, qIndex, p->GetSize());
         const bool queueMark = m_ecnEnabled && m_mmu->ShouldSendCN(ifIndex, qIndex);
-        const bool symphonyMark = m_symphonyMode != 0 && SymphonyMark(p, queueMark);
+        const bool symphonyMark = m_symphonyMode != 0 && SymphonyMark(p, queueMark, ifIndex);
         if (queueMark || symphonyMark) {
-            PppHeader ppp;
-            Ipv4Header h;
-            p->RemoveHeader(ppp);
-            p->RemoveHeader(h);
-            h.SetEcn((Ipv4Header::EcnType)0x03);
-            p->AddHeader(h);
-            p->AddHeader(ppp);
+            if (!g_figure4MarkObserver.IsNull()) {
+                g_figure4MarkObserver(GetId(), ifIndex, queueMark, symphonyMark);
+            }
         }
+        if ((ConWeaveRouting::m_traceMarkProvenance || ConWeaveRouting::m_queueOnlyNotify) &&
+            (queueMark || symphonyMark)) {
+            const uint8_t local = (queueMark ? EcnMarkProvenanceTag::Queue : 0) |
+                                  (symphonyMark ? EcnMarkProvenanceTag::Symphony : 0);
+            const uint8_t cumulative = EcnMarkProvenanceTag::Accumulate(p, local);
+            if (ConWeaveRouting::m_traceMarkProvenance) {
+                std::cout << "ECN_PROV_MARK time_ns=" << Simulator::Now().GetNanoSeconds()
+                          << " switch=" << GetId() << " port=" << ifIndex
+                          << " data_uid=" << p->GetUid() << " local=" << unsigned(local)
+                          << " causes=" << unsigned(cumulative) << '\n';
+            }
+        }
+        ApplyCongestionMarks(p, queueMark, symphonyMark);
         // NOTE: ConWeave's probe/reply does not need to pass inDev interface
         if (inDev != Settings::CONWEAVE_CTRL_DUMMY_INDEV) {
             CheckAndSendResume(inDev, qIndex);
